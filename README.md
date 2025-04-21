@@ -1,4 +1,7 @@
-# Audacity
+# Audacity with some hacks
+
+These are my personal hacks on the audacity source, for making life easier when editing podcasts, they may not suit you, they may not live up to coding standards, they may destroy your whole life, who knows.
+
 
 
 [**Audacity**](https://www.audacityteam.org) is an easy-to-use, multi-track audio editor and recorder for Windows, macOS, GNU/Linux and other operating systems.
