@@ -67,7 +67,7 @@ enum {
    ETBSilenceID,
 
    // no sync-lock on/off button.
-   // #define OPTION_SYNC_LOCK_BUTTON
+   #define OPTION_SYNC_LOCK_BUTTON
 
 #ifdef OPTION_SYNC_LOCK_BUTTON
    ETBSyncLockID,

@@ -66,6 +66,7 @@ from the project that will own the track.
 #include "InconsistencyException.h"
 
 #include <cmath>
+#include <iostream>
 
 using std::max;
 
@@ -2869,6 +2870,19 @@ sampleFormat WaveTrack::WidestEffectiveFormat() const
 bool WaveChannel::HasTrivialEnvelope() const
 {
    return GetTrack().HasTrivialEnvelope();
+}
+
+void WaveTrack::ResetEnvelope() {
+
+   auto pTrack = this;
+   if (!pTrack)
+      return;
+
+   auto clips = pTrack->Intervals();
+   for(auto clip : clips) {
+      clip->GetEnvelope().Clear();
+   }
+
 }
 
 bool WaveTrack::HasTrivialEnvelope() const

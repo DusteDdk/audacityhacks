@@ -135,6 +135,8 @@ enum {
 
    ChannelMenuID,
 
+   OnResetEnvelopeID,
+
    // Range of ids for registered items -- keep this last!
    FirstAttachedItemId,
 };
@@ -513,6 +515,7 @@ struct WaveTrackMenuTable : WaveTrackPopupMenuTable
    void OnMultiView(wxCommandEvent & event);
    void OnSetDisplay(wxCommandEvent & event);
 
+   void OnResetTrackEnvelope(wxCommandEvent & event);
    void OnMergeStereo(wxCommandEvent & event);
 
    // TODO: more-than-two-channels
@@ -635,6 +638,17 @@ BEGIN_POPUP_MENU(WaveTrackMenuTable)
       EndSection();
    EndSection();
 
+   BeginSection( "ResetEnvelope" );
+      AppendItem( "ResetEnvelope", OnResetEnvelopeID, XXO("Reset Envelope"),
+         POPUP_MENU_FN( OnResetTrackEnvelope ),
+         []( PopupMenuHandler &handler, wxMenu &menu, int id ){
+            auto &track = static_cast< WaveTrackMenuTable& >( handler ).FindWaveTrack();
+            bool hasEnvelopeToReset = !(track.HasTrivialEnvelope());
+            menu.Enable( id, hasEnvelopeToReset );
+         }
+      );
+   EndSection();
+
    BeginSection( "Channels" );
       AppendItem( "MakeStereo", OnMergeStereoID, XXO("Ma&ke Stereo Track"),
          POPUP_MENU_FN( OnMergeStereo ),
@@ -741,6 +755,25 @@ void WaveTrackMenuTable::OnSetDisplay(wxCommandEvent & event)
       }
    }
 }
+
+
+/// Reset (clear) envelope for all clips in track
+void WaveTrackMenuTable::OnResetTrackEnvelope(wxCommandEvent &)
+{
+   AudacityProject *const project = &mpData->project;
+
+   auto &trackFocus = TrackFocus::Get( *project ); // Cargo culted, do we need this for a side effect ?
+   auto &track = static_cast<WaveTrack&>(mpData->track);
+   track.ResetEnvelope();
+
+   ProjectHistory::Get(*project).PushState(
+      XO("Reset Envelope for '%s'").Format(track.GetName()),
+      XO("Reset Envelope"));
+
+   mpData->result = RefreshCode::RefreshAll;
+}
+
+
 
 /// Merge two tracks into one stereo track ??
 void WaveTrackMenuTable::OnMergeStereo(wxCommandEvent &)
