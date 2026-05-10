@@ -37,6 +37,7 @@
 #include <wx/wxprec.h>
 
 #include <wx/setup.h> // for wxUSE_* macros
+#include <wx/image.h>
 
 #ifndef WX_PRECOMP
 #include <wx/app.h>
@@ -84,6 +85,16 @@ enum {
 #endif
 
 constexpr int first_ETB_ID = 11300;
+
+namespace {
+wxImage SolidButtonImage(const wxImage &base, const wxColour &colour)
+{
+   wxImage image{ base.GetSize() };
+   image.SetRGB(wxRect{ image.GetSize() },
+      colour.Red(), colour.Green(), colour.Blue());
+   return image;
+}
+}
 
 static const ToolBarButtons::ButtonList EditToolbarButtonList = {
    { ETBZoomInID,   wxT("ZoomIn"),      XO("Zoom In")  },
@@ -153,12 +164,13 @@ void EditToolBar::AddSeparator()
    mToolSizer->AddSpacer(0);
 }
 
-void EditToolBar::AddButton(
+AButton *EditToolBar::AddButton(
    teBmps eEnabledUp, teBmps eEnabledDown, teBmps eDisabled,
    int id, const TranslatableString &label, bool toggle)
 {
    auto r = mButtons.CreateButton(eEnabledUp, eEnabledDown, eDisabled, id, label, toggle);
    mToolSizer->Add(r);
+   return r;
 }
 
 void EditToolBar::Populate()
@@ -190,8 +202,17 @@ void EditToolBar::Populate()
       XO("Silence audio selection"));
 
 #ifdef OPTION_SYNC_LOCK_BUTTON
-   AddButton(bmpSyncLockTracksUp, bmpSyncLockTracksDown, bmpSyncLockTracksUp, ETBSyncLockID,
+   auto syncLockButton = AddButton(bmpSyncLockTracksUp, bmpSyncLockTracksDown, bmpSyncLockTracksUp, ETBSyncLockID,
       XO("Sync-Lock Tracks"), true);
+   const auto green =
+      SolidButtonImage(theTheme.Image(bmpRecoloredDownSmall), wxColour(0, 220, 0));
+   // Bright green makes the global sync-lock mode visually hard to miss.
+   syncLockButton->SetImages(
+      theTheme.Image(bmpRecoloredUpSmall),
+      theTheme.Image(bmpRecoloredUpHiliteSmall),
+      green,
+      green,
+      theTheme.Image(bmpRecoloredUpSmall));
 #else
    AddSeparator();
 #endif
@@ -254,4 +275,3 @@ AttachedToolBarMenuItem sAttachment{
    EditToolBar::ID(), wxT("ShowEditTB"), XXO("&Edit Toolbar")
 };
 }
-

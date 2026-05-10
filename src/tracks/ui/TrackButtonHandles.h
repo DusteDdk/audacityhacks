@@ -15,6 +15,34 @@ Paul Licameli split from TrackPanel.cpp
 
 class wxMouseState;
 
+class SyncLockButtonHandle final : public ButtonHandle
+{
+   SyncLockButtonHandle(const SyncLockButtonHandle&) = delete;
+
+protected:
+   Result CommitChanges
+      (const wxMouseEvent &event, AudacityProject *pProject, wxWindow *pParent)
+      override;
+
+   TranslatableString Tip(
+      const wxMouseState &state, AudacityProject &) const override;
+
+public:
+   explicit SyncLockButtonHandle
+      ( const std::shared_ptr<Track> &pTrack, const wxRect &rect );
+
+   SyncLockButtonHandle &operator=(const SyncLockButtonHandle&) = default;
+
+   virtual ~SyncLockButtonHandle();
+
+   static UIHandlePtr HitTest
+      (std::weak_ptr<SyncLockButtonHandle> &holder,
+       const wxMouseState &state, const wxRect &rect, TrackPanelCell *pCell,
+       const AudacityProject *project);
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
 class MinimizeButtonHandle final : public ButtonHandle
 {
    MinimizeButtonHandle(const MinimizeButtonHandle&) = delete;

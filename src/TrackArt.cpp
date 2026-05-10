@@ -22,6 +22,8 @@
 #include "ZoomInfo.h"
 #include "TimeDisplayMode.h"
 #include "ProjectTimeRuler.h"
+#include "ProjectAudioManager.h"
+#include "TrackPanel.h"
 
 #include "ProjectTimeSignature.h"
 
@@ -758,11 +760,26 @@ void TrackArt::DrawCursor(TrackPanelDrawingContext& context,
 {
    const auto dc = &context.dc;
    const auto artist = TrackArtist::Get(context);
+   const auto& zoomInfo = *artist->pZoomInfo;
+
+   if (const auto project = artist->parent->GetProject()) {
+      if (const auto sentinel =
+             ProjectAudioManager::Get(*project).GetSentinelPlaybackPosition()) {
+         const auto x =
+            static_cast<int>(zoomInfo.TimeToPosition(*sentinel, rect.x));
+         if (x >= rect.GetLeft() && x <= rect.GetRight()) {
+            // The sentinel is deliberately orange and track-spanning so it is
+            // distinguishable from the regular black edit cursor.
+            dc->SetPen(wxPen(wxColour(255, 128, 0), 1));
+            AColor::Line(*dc, x, rect.GetTop(), x, rect.GetBottom());
+         }
+      }
+   }
+
    const auto& selectedRegion = *artist->pSelectedRegion;
 
    if (selectedRegion.isPoint())
    {
-       const auto& zoomInfo = *artist->pZoomInfo;
        auto x = static_cast<int>(zoomInfo.TimeToPosition(selectedRegion.t0(), rect.x));
        if (x >= rect.GetLeft() && x <= rect.GetRight())
        {

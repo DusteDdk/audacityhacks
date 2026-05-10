@@ -11,10 +11,60 @@ Paul Licameli split from Track.cpp
 
 #include "SyncLock.h"
 
+#include "XMLAttributeValueView.h"
+#include "XMLWriter.h"
 #include "PendingTracks.h"
 #include "Prefs.h"
 #include "Project.h"
 #include "Track.h"
+
+namespace {
+class SyncLockTrackState final : public TrackAttachment
+{
+public:
+   static SyncLockTrackState &Get(const Track &track)
+   {
+      return const_cast<Track&>(track)
+         .AttachedObjects::Get<SyncLockTrackState>(sKey);
+   }
+
+   void CopyTo(Track &track) const override
+   {
+      Get(track).mExcluded = mExcluded;
+   }
+
+   void WriteXMLAttributes(XMLWriter &writer) const override
+   {
+      if (mExcluded)
+         writer.WriteAttr(SyncLockExcluded_attr, true);
+   }
+
+   bool HandleXMLAttribute(
+      const std::string_view& attr, const XMLAttributeValueView& valueView)
+      override
+   {
+      bool value{};
+      if (attr == SyncLockExcluded_attr && valueView.TryGet(value)) {
+         mExcluded = value;
+         return true;
+      }
+      return false;
+   }
+
+   bool IsExcluded() const { return mExcluded; }
+   void SetExcluded(bool excluded) { mExcluded = excluded; }
+
+private:
+   static constexpr auto SyncLockExcluded_attr = "syncLockExcluded";
+   bool mExcluded{ false };
+
+   static const AttachedTrackObjects::RegisteredFactory sKey;
+};
+
+const AttachedTrackObjects::RegisteredFactory SyncLockTrackState::sKey{
+   [](Track &) { return std::make_shared<SyncLockTrackState>(); }
+};
+}
 
 static const AudacityProject::AttachedObjects::RegisteredFactory
 sSyncLockStateKey{
@@ -57,12 +107,14 @@ void SyncLockState::SetSyncLock(bool flag)
 namespace {
 inline bool IsSyncLockableNonSeparatorTrack(const Track &track)
 {
-   return GetSyncLockPolicy::Call(track) == SyncLockPolicy::Grouped;
+   return !SyncLock::IsExcluded(track) &&
+      GetSyncLockPolicy::Call(track) == SyncLockPolicy::Grouped;
 }
 
 inline bool IsSeparatorTrack(const Track &track)
 {
-   return GetSyncLockPolicy::Call(track) == SyncLockPolicy::EndSeparator;
+   return !SyncLock::IsExcluded(track) &&
+      GetSyncLockPolicy::Call(track) == SyncLockPolicy::EndSeparator;
 }
 
 bool IsGoodNextSyncLockTrack(const Track &t, bool inSeparatorSection)
@@ -79,6 +131,9 @@ bool IsGoodNextSyncLockTrack(const Track &t, bool inSeparatorSection)
 
 bool SyncLock::IsSyncLockSelected(const Track &track)
 {
+   if (IsExcluded(track))
+      return false;
+
    auto pList = track.GetOwner();
    if (!pList)
       return false;
@@ -104,6 +159,28 @@ bool SyncLock::IsSyncLockSelected(const Track &track)
 bool SyncLock::IsSelectedOrSyncLockSelected(const Track &track)
 {
    return track.IsSelected() || IsSyncLockSelected(track);
+}
+
+bool SyncLock::IsSyncLockable(const Track &track)
+{
+   const auto policy = GetSyncLockPolicy::Call(track);
+   return policy == SyncLockPolicy::Grouped ||
+      policy == SyncLockPolicy::EndSeparator;
+}
+
+bool SyncLock::IsExcluded(const Track &track)
+{
+   return SyncLockTrackState::Get(track).IsExcluded();
+}
+
+void SyncLock::SetExcluded(Track &track, bool excluded)
+{
+   auto &state = SyncLockTrackState::Get(track);
+   if (state.IsExcluded() == excluded)
+      return;
+
+   state.SetExcluded(excluded);
+   track.Notify(true);
 }
 
 namespace {

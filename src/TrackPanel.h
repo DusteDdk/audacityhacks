@@ -96,6 +96,7 @@ class AUDACITY_DLL_API TrackPanel final
    void OnTimer(wxTimerEvent& event);
    void OnSyncLockChange(struct SyncLockChangeMessage);
    void OnTrackFocusChange(struct TrackFocusChangeMessage);
+   void UpdateSelectedTrackMultimode();
 
    void OnUndoReset(struct UndoRedoMessage);
 

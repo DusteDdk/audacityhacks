@@ -67,6 +67,7 @@ time warp info and AudioIOListener and whether the playback is looped.
 #include "DeviceManager.h"
 
 #include <cfloat>
+#include <cmath>
 #include <math.h>
 #include <stdlib.h>
 #include <algorithm>
@@ -1635,6 +1636,11 @@ void AudioIO::StopStream()
 
    if (pListener && mNumCaptureChannels > 0)
       pListener->OnAudioIOStopRecording();
+   if (pListener && mNumPlaybackChannels > 0) {
+      const auto time = mPlaybackSchedule.GetSequenceTime();
+      if (std::isfinite(time))
+         pListener->OnAudioIOStopPlayback(time);
+   }
 
    BasicUI::CallAfter([this]{
       if (mPortStreamV19 && mNumCaptureChannels > 0)

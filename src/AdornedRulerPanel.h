@@ -20,6 +20,8 @@
 #include "ViewInfo.h" // for PlayRegion
 #include "TimeDisplayMode.h"
 
+#include <optional>
+
 class AudacityProject;
 struct AudioIOEvent;
 class LinearUpdater;
@@ -110,6 +112,7 @@ private:
    void DoDrawOverlap(wxDC * dc, const wxRect &rect);
    void DoDrawSelection(wxDC * dc,
       const wxRect &rectS, const wxRect &rectL, const wxRect &rectR);
+   void DoDrawSentinelCursor(wxDC * dc);
 
 public:
    void DoDrawScrubIndicator(wxDC * dc, wxCoord xx, int width, bool scrub, bool seek);
@@ -254,6 +257,7 @@ private:
    SelectedRegion mLastDrawnSelectedRegion;
    std::pair<double, double> mLastDrawnPlayRegion{};
    bool mLastPlayRegionActive = false;
+   std::optional<double> mLastDrawnSentinel;
    double mLastDrawnH{};
    double mLastDrawnZoom{};
 

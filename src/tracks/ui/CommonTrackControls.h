@@ -17,6 +17,7 @@ class CloseButtonHandle;
 class MenuButtonHandle;
 class PopupMenuTable;
 class MinimizeButtonHandle;
+class SyncLockButtonHandle;
 class TrackSelectHandle;
 
 namespace TrackInfo{ struct TCPLine; }
@@ -64,6 +65,7 @@ protected:
    std::weak_ptr<CloseButtonHandle> mCloseHandle;
    std::weak_ptr<MenuButtonHandle> mMenuHandle;
    std::weak_ptr<MinimizeButtonHandle> mMinimizeHandle;
+   std::weak_ptr<SyncLockButtonHandle> mSyncLockHandle;
    std::weak_ptr<TrackSelectHandle> mSelectHandle;
 };
 

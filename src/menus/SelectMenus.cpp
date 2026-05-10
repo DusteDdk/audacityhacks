@@ -1,20 +1,17 @@
 #include "../AdornedRulerPanel.h"
 #include "AudioIO.h"
-#include "BasicUI.h"
 #include "../CommonCommandFlags.h"
 #include "Prefs.h"
 #include "Project.h"
 #include "ProjectAudioIO.h"
 #include "../ProjectAudioManager.h"
 #include "ProjectHistory.h"
-#include "ProjectRate.h"
 #include "ProjectSnap.h"
 #include "../ProjectWindows.h"
 #include "../SelectUtilities.h"
 #include "SyncLock.h"
 #include "../TrackPanel.h"
 #include "Viewport.h"
-#include "WaveClip.h"
 #include "WaveTrack.h"
 #include "LabelTrack.h"
 #include "CommandContext.h"
@@ -26,89 +23,6 @@
 
 // private helper classes and functions
 namespace {
-
-constexpr auto GetWindowSize(double projectRate)
-{
-   return size_t(std::max(1.0, projectRate / 100));
-}
-
-double NearestZeroCrossing(AudacityProject &project, double t0)
-{
-   auto rate = ProjectRate::Get(project).GetRate();
-   auto &tracks = TrackList::Get( project );
-
-   // Window is 1/100th of a second.
-   auto windowSize = GetWindowSize(rate);
-   Floats dist{ windowSize, true };
-
-   int nTracks = 0;
-   for (auto one : tracks.Selected<const WaveTrack>()) {
-      const auto nChannels = one->NChannels();
-      auto oneWindowSize = size_t(std::max(1.0, one->GetRate() / 100));
-      Floats buffer1{ oneWindowSize };
-      Floats buffer2{ oneWindowSize };
-      float *const buffers[]{ buffer1.get(), buffer2.get() };
-      auto s = one->TimeToLongSamples(t0);
-
-      // fillTwo to ensure that missing values are treated as 2, and hence do
-      // not get used as zero crossings.
-      one->GetFloats(0, nChannels, buffers,
-         s - (int)oneWindowSize/2, oneWindowSize, false, FillFormat::fillTwo);
-
-
-      // Looking for actual crossings.  Update dist
-      for (size_t iChannel = 0; iChannel < nChannels; ++iChannel) {
-         const auto oneDist = buffers[iChannel];
-         double prev = 2.0;
-         for (size_t i = 0; i < oneWindowSize; ++i) {
-            float fDist = fabs(oneDist[i]); // score is absolute value
-            if (prev * oneDist[i] > 0) // both same sign?  No good.
-               fDist = fDist + 0.4; // No good if same sign.
-            else if (prev > 0.0)
-               fDist = fDist + 0.1; // medium penalty for downward crossing.
-            prev = oneDist[i];
-            oneDist[i] = fDist;
-         }
-
-         // TODO: The mixed rate zero crossing code is broken,
-         // if oneWindowSize > windowSize we'll miss out some
-         // samples - so they will still be zero, so we'll use them.
-         for (size_t i = 0; i < windowSize; i++) {
-            size_t j;
-            if (windowSize != oneWindowSize)
-               j = i * (oneWindowSize - 1) / (windowSize - 1);
-            else
-               j = i;
-
-            dist[i] += oneDist[j];
-            // Apply a small penalty for distance from the original endpoint
-            // We'll always prefer an upward
-            dist[i] +=
-               0.1 * (abs(int(i) - int(windowSize / 2))) / float(windowSize / 2);
-         }
-      }
-      nTracks++;
-   }
-
-   // Find minimum
-   int argmin = 0;
-   float min = 3.0;
-   for (size_t i = 0; i < windowSize; ++i) {
-      if (dist[i] < min) {
-         argmin = i;
-         min = dist[i];
-      }
-   }
-
-   // If we're worse than 0.2 on average, on one track, then no good.
-   if ((nTracks == 1) && (min > (0.2 * nTracks)))
-      return t0;
-   // If we're worse than 0.6 on average, on multi-track, then no good.
-   if ((nTracks > 1) && (min > (0.6 * nTracks)))
-      return t0;
-
-   return t0 + (argmin - (int)windowSize / 2) / rate;
-}
 
 // If this returns true, then there was a key up, and nothing more to do,
 // after this function has completed.
@@ -631,52 +545,21 @@ void OnCursorPositionStore(const CommandContext &context)
 void OnZeroCrossing(const CommandContext &context)
 {
    auto &project = context.project;
-   auto &selectedRegion = ViewInfo::Get( project ).selectedRegion;
-   const auto& tracks = TrackList::Get(project);
-
-   // Selecting precise sample indices across tracks that may have clips with
-   // various stretch ratios in itself is not possible. Even in single-track
-   // mode, we cannot know what the final waveform will look like until
-   // stretching is applied, making this operation futile. Hence we disallow
-   // it if any stretched clip is involved.
-   const auto projectRate = ProjectRate(project).GetRate();
-   const auto searchWindowDuration = GetWindowSize(projectRate) / projectRate;
-   const auto wouldSearchClipWithPitchOrSpeed =
-      [searchWindowDuration](const WaveTrack& track, double t)
-   {
-      const auto clips = track.GetSortedClipsIntersecting(
-         t - searchWindowDuration / 2, t + searchWindowDuration / 2);
-      return any_of(
-         clips.begin(), clips.end(),
-         [](const auto& clip) { return clip->HasPitchOrSpeed(); });
-   };
-   const auto selected = tracks.Selected<const WaveTrack>();
-   if (std::any_of(
-          selected.begin(), selected.end(), [&](const WaveTrack* track) {
-             return wouldSearchClipWithPitchOrSpeed(
-                       *track, selectedRegion.t0()) ||
-                    wouldSearchClipWithPitchOrSpeed(
-                       *track, selectedRegion.t1());
-          }))
-   {
-      using namespace BasicUI;
-      ShowMessageBox(
-         XO("Zero-crossing search regions intersect stretched clip(s)."),
-         MessageBoxOptions {}.Caption(XO("Error")).IconStyle(Icon::Error));
-      return;
-   }
-
-   const double t0 = NearestZeroCrossing(project, selectedRegion.t0());
-   if (selectedRegion.isPoint())
-      selectedRegion.setTimes(t0, t0);
-   else {
-      const double t1 = NearestZeroCrossing(project, selectedRegion.t1());
-      // Empty selection is generally not much use, so do not make it if empty.
-      if( fabs( t1 - t0 ) * ProjectRate::Get(project).GetRate() > 1.5 )
-         selectedRegion.setTimes(t0, t1);
-   }
+   SelectUtilities::AdjustSelectionToZeroCrossing(project, false, true);
 
    ProjectHistory::Get( project ).ModifyState(false);
+}
+
+void OnAdjustSelectionToZeroCrossOnSelection(const CommandContext &WXUNUSED(context))
+{
+   SelectUtilities::AdjustSelectionToZeroCrossOnSelection.Toggle();
+   gPrefs->Flush();
+}
+
+void OnAutoZeroCrossSelectionOnSelectedOnly(const CommandContext &WXUNUSED(context))
+{
+   SelectUtilities::AutoZeroCrossSelectionOnSelectedOnly.Toggle();
+   gPrefs->Flush();
 }
 
 void OnSnapToOff(const CommandContext &context)
@@ -957,6 +840,21 @@ auto SelectMenu()
    ( FinderScope{ findCommandHandler },
    /* i18n-hint: (verb) It's an item on a menu. */
    Menu( wxT("Select"), XXO("&Select"),
+      Section( "",
+         // These are user preferences, not editing commands.  Keep them at
+         // the top of Select so the auto-zero-cross behavior is easy to see.
+         Command( wxT("AdjustSelectionToZeroCrossOnSelection"),
+            XXO("Adjust to Zero Cross on selection"),
+            FN(OnAdjustSelectionToZeroCrossOnSelection), AlwaysEnabledFlag,
+            Options{}.CheckTest(
+               SelectUtilities::AdjustSelectionToZeroCrossOnSelection ) ),
+         Command( wxT("AutoZeroCrossSelectionOnSelectedOnly"),
+            XXO("Auto zero cross selection on selected only"),
+            FN(OnAutoZeroCrossSelectionOnSelectedOnly), AlwaysEnabledFlag,
+            Options{}.CheckTest(
+               SelectUtilities::AutoZeroCrossSelectionOnSelectedOnly ) )
+      ),
+
       Section( "Basic",
          Command( wxT("SelectAll"), XXO("&All"), FN(OnSelectAll),
             TracksExistFlag(),

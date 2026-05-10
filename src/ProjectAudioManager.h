@@ -12,6 +12,7 @@ Paul Licameli split from ProjectManager.h
 #define __AUDACITY_PROJECT_AUDIO_MANAGER__
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "AudioIOListener.h" // to inherit
@@ -134,6 +135,14 @@ public:
    void DoPlayStopSelect( );
 
    PlayMode GetLastPlayMode() const { return mLastPlayMode; }
+   std::optional<double> GetLastKnownPlaybackPosition() const
+   { return mLastKnownPlaybackPosition; }
+   void SetLastKnownPlaybackPosition(double position)
+   { mLastKnownPlaybackPosition = position; }
+   std::optional<double> GetSentinelPlaybackPosition() const
+   { return mSentinelPlaybackPosition; }
+   void SetSentinelPlaybackPosition(double position)
+   { mSentinelPlaybackPosition = position; }
 
 private:
 
@@ -152,6 +161,7 @@ private:
    void OnAudioIORate(int rate) override;
    void OnAudioIOStartRecording() override;
    void OnAudioIOStopRecording() override;
+   void OnAudioIOStopPlayback(double time) override;
    void OnAudioIONewBlocks() override;
    void OnCommitRecording() override;
    void OnSoundActivationThreshold() override;
@@ -162,6 +172,10 @@ private:
    AudacityProject &mProject;
 
    PlayMode mLastPlayMode{ PlayMode::normalPlay };
+   std::optional<double> mLastKnownPlaybackPosition;
+   // Ctrl-click sets this visible play-over anchor.  It intentionally
+   // overrides the hidden last-played fallback without changing selection.
+   std::optional<double> mSentinelPlaybackPosition;
 
    //flag for cancellation of timer record.
    bool mTimerRecordCanceled{ false };

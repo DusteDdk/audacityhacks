@@ -47,7 +47,7 @@ class EditToolBar final : public ToolBar {
 
  private:
 
-   void AddButton(
+   AButton *AddButton(
       teBmps eEnabledUp, teBmps eEnabledDown, teBmps eDisabled,
       int id, const TranslatableString &label, bool toggle = false);
 
@@ -65,4 +65,3 @@ class EditToolBar final : public ToolBar {
 };
 
 #endif
-

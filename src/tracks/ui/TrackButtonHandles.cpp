@@ -18,6 +18,7 @@ Paul Licameli split from TrackPanel.cpp
 #include "ProjectHistory.h"
 #include "../../SelectUtilities.h"
 #include "../../RefreshCode.h"
+#include "SyncLock.h"
 #include "Track.h"
 #include "TrackFocus.h"
 #include "CommonTrackInfo.h"
@@ -25,6 +26,61 @@ Paul Licameli split from TrackPanel.cpp
 #include "../../TrackUtilities.h"
 #include "CommandManager.h"
 #include "../../tracks/ui/ChannelView.h"
+
+SyncLockButtonHandle::SyncLockButtonHandle
+( const std::shared_ptr<Track> &pTrack, const wxRect &rect )
+   : ButtonHandle{ pTrack, rect }
+{}
+
+SyncLockButtonHandle::~SyncLockButtonHandle()
+{
+}
+
+UIHandle::Result SyncLockButtonHandle::CommitChanges
+(const wxMouseEvent &, AudacityProject *pProject, wxWindow*)
+{
+   if (auto pTrack = mpTrack.lock()) {
+      // Per-track opt-out only matters while global sync-lock is enabled.
+      SyncLock::SetExcluded(*pTrack, !SyncLock::IsExcluded(*pTrack));
+      ProjectHistory::Get(*pProject).ModifyState(true);
+      return RefreshCode::RefreshAll;
+   }
+   return RefreshCode::RefreshNone;
+}
+
+TranslatableString SyncLockButtonHandle::Tip(
+   const wxMouseState &, AudacityProject &) const
+{
+   auto pTrack = GetTrack();
+   return SyncLock::IsExcluded(*pTrack)
+      ? XO("Include in Sync-Lock")
+      : XO("Ignore Sync-Lock");
+}
+
+UIHandlePtr SyncLockButtonHandle::HitTest
+(std::weak_ptr<SyncLockButtonHandle> &holder,
+ const wxMouseState &state, const wxRect &rect, TrackPanelCell *pCell,
+ const AudacityProject *project)
+{
+   if (!project || !SyncLockState::Get(*project).IsSyncLocked())
+      return {};
+
+   wxRect buttonRect;
+   CommonTrackInfo::GetSyncLockIconRect(rect, buttonRect);
+   auto pTrack = static_cast<CommonTrackPanelCell*>(pCell)->FindTrack();
+
+   if (pTrack && SyncLock::IsSyncLockable(*pTrack) &&
+      buttonRect.Contains(state.m_x, state.m_y)) {
+      auto result =
+         std::make_shared<SyncLockButtonHandle>( pTrack, buttonRect );
+      result = AssignUIHandlePtr(holder, result);
+      return result;
+   }
+   else
+      return {};
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 MinimizeButtonHandle::MinimizeButtonHandle
 ( const std::shared_ptr<Track> &pTrack, const wxRect &rect )

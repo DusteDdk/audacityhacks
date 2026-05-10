@@ -10,6 +10,7 @@
 
 #include "WaveClipAdjustBorderHandle.h"
 #include "ProjectAudioIO.h"
+#include "ProjectAudioManager.h"
 #include "RefreshCode.h"
 
 #include <wx/event.h>
@@ -182,6 +183,15 @@ private:
                   addSnapPoint(interval->End(), track);
             }
          }
+      }
+
+      if(const auto trackList = currentTrack->GetOwner())
+      {
+         // The sentinel is shared across tracks, so border edits can snap to it.
+         const auto sentinel = ProjectAudioManager::Get(
+            *trackList->GetOwner()).GetSentinelPlaybackPosition();
+         if(sentinel)
+            addSnapPoint(*sentinel, nullptr);
       }
       return result;
    }

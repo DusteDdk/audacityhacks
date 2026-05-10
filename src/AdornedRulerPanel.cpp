@@ -1515,6 +1515,8 @@ void AdornedRulerPanel::DoIdle()
      || mLastDrawnH != viewInfo.hpos
      || mLastDrawnZoom != viewInfo.GetZoom()
      || mLastPlayRegionActive != viewInfo.playRegion.Active()
+     || mLastDrawnSentinel !=
+         ProjectAudioManager::Get(project).GetSentinelPlaybackPosition()
    ;
    if (changed && !isIconized)
       // Cause ruler redraw anyway, because we may be zooming or scrolling,
@@ -1556,6 +1558,8 @@ void AdornedRulerPanel::OnPaint(wxPaintEvent & WXUNUSED(evt))
    mLastDrawnZoom = viewInfo.GetZoom();
    mLastDrawnPlayRegion = playRegionBounds;
    mLastDrawnSelectedRegion = viewInfo.selectedRegion;
+   mLastDrawnSentinel =
+      ProjectAudioManager::Get(*GetProject()).GetSentinelPlaybackPosition();
    // To do, note other fisheye state when we have that
 
    wxPaintDC dc(this);
@@ -1588,6 +1592,7 @@ void AdornedRulerPanel::OnPaint(wxPaintEvent & WXUNUSED(evt))
    DoDrawMarks(&backDC, true);
 
    DoDrawEdge(&backDC);
+   DoDrawSentinelCursor(&backDC);
 
    DisplayBitmap(dc);
 
@@ -2301,6 +2306,10 @@ void AdornedRulerPanel::HandleSnapping(size_t index)
          SnapPoint{ selectedRegion.t0() },
          SnapPoint{ selectedRegion.t1() },
       };
+   // Treat the sentinel like any other ruler item during play-region drags.
+   if (const auto sentinel =
+      ProjectAudioManager::Get(*mProject).GetSentinelPlaybackPosition())
+      candidates.emplace_back(*sentinel);
    SnapManager snapManager{ *mProject, *mTracks, *mViewInfo, move(candidates) };
    auto results = snapManager.Snap(nullptr, mQuickPlayPos[index], false);
    mQuickPlayPos[index] = results.outTime;
@@ -2586,6 +2595,32 @@ void AdornedRulerPanel::DoDrawSelection(
    dc->SetPen( *wxTRANSPARENT_PEN );
    dc->DrawRectangle( rectS.Intersect(rectL) );
    dc->DrawRectangle( rectS.Intersect(rectR) );
+}
+
+void AdornedRulerPanel::DoDrawSentinelCursor(wxDC * dc)
+{
+   const auto sentinel =
+      ProjectAudioManager::Get(*mProject).GetSentinelPlaybackPosition();
+   if (!sentinel)
+      return;
+
+   const auto x = Time2Pos(*sentinel);
+   if (x < mInner.GetLeft() || x > mInner.GetRight())
+      return;
+
+   constexpr int side = 7;
+   const auto top = mInner.GetTop();
+   wxPoint points[] {
+      { x, top + side },
+      { x - side, top },
+      { x + side, top },
+   };
+
+   // Match the track-spanning sentinel line; the orange marker separates it
+   // from the normal playback pointer bitmap and the regular edit cursor.
+   dc->SetPen(wxPen(wxColour(255, 128, 0), 1));
+   dc->SetBrush(wxBrush(wxColour(255, 128, 0)));
+   dc->DrawPolygon(3, points);
 }
 
 int AdornedRulerPanel::GetRulerHeight(bool showScrubBar)

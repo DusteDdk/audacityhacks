@@ -34,7 +34,7 @@ Paul Licameli split from TrackControls.cpp
 
 std::vector<UIHandlePtr> CommonTrackControls::HitTest
 (const TrackPanelMouseState &st,
- const AudacityProject *WXUNUSED(project))
+ const AudacityProject *project)
 {
    // Hits are mutually exclusive, results single
 
@@ -55,6 +55,10 @@ std::vector<UIHandlePtr> CommonTrackControls::HitTest
 
    if (NULL != (result = MinimizeButtonHandle::HitTest(
       mMinimizeHandle, state, rect, this)))
+      results.push_back(result);
+
+   if (NULL != (result = SyncLockButtonHandle::HitTest(
+      mSyncLockHandle, state, rect, this, project)))
       results.push_back(result);
 
    if (results.empty()) {

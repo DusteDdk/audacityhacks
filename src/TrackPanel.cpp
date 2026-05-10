@@ -46,6 +46,7 @@ is time to refresh some aspect of the screen.
 
 #include "TrackPanel.h"
 #include "TrackPanelConstants.h"
+#include "TrackPanelDrawingContext.h"
 
 #include <wx/setup.h> // for wxUSE_* macros
 
@@ -82,8 +83,11 @@ is time to refresh some aspect of the screen.
 #include "TrackPanelResizerCell.h"
 #include "Viewport.h"
 #include "WaveTrack.h"
+#include "WaveChannelViewConstants.h"
+#include "tracks/playabletrack/wavetrack/ui/WaveChannelView.h"
 
 #include "FrameStatistics.h"
+#include "HitTestResult.h"
 
 #include "tracks/ui/TrackControls.h"
 #include "tracks/ui/ChannelView.h"
@@ -93,12 +97,887 @@ is time to refresh some aspect of the screen.
 #include "../images/Cursors.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
+#include <wx/app.h>
 #include <wx/dc.h>
 #include <wx/dcclient.h>
 #include <wx/graphics.h>
+#include <wx/weakref.h>
 
 #include "RealtimeEffectManager.h"
+
+BoolSetting SetSelectedTrackMultimode{
+   L"/GUI/SetSelectedTrackMultimode", true
+};
+
+BoolSetting ShowContentTrack{
+   L"/GUI/ShowContentTrack", true
+};
+
+BoolSetting ContentTrackEnabled{
+   L"/GUI/ContentTrackEnabled", true
+};
+
+IntSetting ContentTrackHeightSetting{
+   L"/GUI/ContentTrackHeight", 44
+};
+
+IntSetting ContentTrackIndexSetting{
+   L"/GUI/ContentTrackIndex", 0
+};
+
+namespace {
+enum class ContentTrackState
+{
+   Off,
+   Silence,
+   On
+};
+
+enum class ContentOverlayState
+{
+   Off,
+   InaudibleOverlay,
+   Overlay
+};
+
+constexpr int ContentTrackHeight = 44;
+constexpr int ContentTrackStepPixels = 3;
+constexpr size_t ContentTrackWindowSamples = 100;
+constexpr double ContentTrackOffThreshold = 0.000011220184543; // -99 dBFS.
+constexpr double ContentTrackOnThreshold = 0.01; // -40 dBFS.
+constexpr double ContentTrackOverlayThreshold = 0.005623413252; // -45 dBFS.
+
+struct SavedSelectedTrackView
+{
+   std::weak_ptr<WaveTrack> track;
+   bool multiView{ false };
+   WaveChannelSubViewPlacements placements;
+};
+
+using SelectedTrackViewMap = std::map<TrackId, SavedSelectedTrackView>;
+std::unordered_map<TrackPanel *, SelectedTrackViewMap> sSelectedTrackMultimode;
+
+struct ContentTrackSegment
+{
+   int x0{};
+   int x1{};
+   ContentTrackState state{ ContentTrackState::Off };
+   ContentOverlayState overlay{ ContentOverlayState::Off };
+};
+
+struct ContentTrackAnalysis
+{
+   ContentTrackState state{ ContentTrackState::Off };
+   ContentOverlayState overlay{ ContentOverlayState::Off };
+};
+
+bool SameContentAnalysis(
+   const ContentTrackAnalysis &left, const ContentTrackAnalysis &right)
+{
+   return left.state == right.state && left.overlay == right.overlay;
+}
+
+struct ContentTrackRenderKey
+{
+   AudacityProject *project{};
+   double hpos{};
+   double zoom{};
+   int leftOffset{};
+   int width{};
+   int height{};
+   uint64_t generation{};
+
+   bool operator==(const ContentTrackRenderKey &other) const
+   {
+      return project == other.project
+         && hpos == other.hpos
+         && zoom == other.zoom
+         && leftOffset == other.leftOffset
+         && width == other.width
+         && height == other.height
+         && generation == other.generation;
+   }
+};
+
+struct ContentTrackRenderCache
+{
+   std::mutex mutex;
+   std::shared_ptr<wxBitmap> bitmap;
+   ContentTrackRenderKey readyKey;
+   ContentTrackRenderKey runningKey;
+   ContentTrackRenderKey scheduledKey;
+   std::atomic<uint64_t> generation{ 0 };
+   std::atomic<uint64_t> renderSerial{ 0 };
+   bool hasReady{ false };
+   bool running{ false };
+   bool scheduled{ false };
+};
+
+ContentTrackRenderCache sContentTrackRender;
+
+class ContentTrackThreadPool
+{
+public:
+   ContentTrackThreadPool()
+   {
+      const auto cpus = std::thread::hardware_concurrency();
+      const auto count = std::max(1u, cpus > 2 ? cpus - 2 : 1);
+      mWorkers.reserve(count);
+      for (auto ii = 0u; ii < count; ++ii) {
+         mWorkers.emplace_back([this] {
+            while (true) {
+               std::function<void()> job;
+               {
+                  std::unique_lock<std::mutex> lock{ mMutex };
+                  mCondition.wait(lock, [this] {
+                     return mStop || !mJobs.empty();
+                  });
+                  if (mStop && mJobs.empty())
+                     return;
+                  job = std::move(mJobs.front());
+                  mJobs.pop_front();
+               }
+               job();
+            }
+         });
+      }
+   }
+
+   ~ContentTrackThreadPool()
+   {
+      {
+         std::lock_guard<std::mutex> lock{ mMutex };
+         mStop = true;
+      }
+      mCondition.notify_all();
+      for (auto &worker : mWorkers) {
+         if (worker.joinable())
+            worker.join();
+      }
+   }
+
+   unsigned Size() const
+   {
+      return std::max<size_t>(1, mWorkers.size());
+   }
+
+   void Post(std::function<void()> job)
+   {
+      {
+         std::lock_guard<std::mutex> lock{ mMutex };
+         mJobs.push_back(std::move(job));
+      }
+      mCondition.notify_one();
+   }
+
+private:
+   mutable std::mutex mMutex;
+   std::condition_variable mCondition;
+   std::deque<std::function<void()>> mJobs;
+   std::vector<std::thread> mWorkers;
+   bool mStop{ false };
+};
+
+ContentTrackThreadPool &ContentTrackPool()
+{
+   static ContentTrackThreadPool pool;
+   return pool;
+}
+
+ContentTrackState ContentStateForPeak(double peak)
+{
+   if (peak < ContentTrackOffThreshold)
+      return ContentTrackState::Off;
+   if (peak < ContentTrackOnThreshold)
+      return ContentTrackState::Silence;
+   return ContentTrackState::On;
+}
+
+wxColour ContentTrackColor(ContentTrackState state)
+{
+   switch (state) {
+   case ContentTrackState::On:
+      return wxColour(35, 150, 70);
+   case ContentTrackState::Silence:
+      return wxColour(188, 143, 38);
+   case ContentTrackState::Off:
+   default:
+      return wxColour(48, 48, 52);
+   }
+}
+
+wxColour ContentOverlayColor(ContentOverlayState state)
+{
+   switch (state) {
+   case ContentOverlayState::Overlay:
+      return wxColour(190, 45, 45);
+   case ContentOverlayState::InaudibleOverlay:
+      return wxColour(210, 180, 45);
+   case ContentOverlayState::Off:
+   default:
+      return wxColour(45, 145, 70);
+   }
+}
+
+ContentTrackAnalysis ClassifyContentWindow(
+   const std::vector<std::shared_ptr<WaveTrack>> &tracks, double time)
+{
+   std::array<float, ContentTrackWindowSamples> buffer{};
+   float peak = 0.0f;
+   auto contributingTracks = 0;
+   auto overlayTracks = 0;
+
+   for (const auto &waveTrack : tracks) {
+      float trackPeak = 0.0f;
+      for (const auto pChannel : waveTrack->Channels()) {
+         buffer.fill(0.0f);
+
+         const auto start =
+            std::max(sampleCount(0), pChannel->TimeToLongSamples(time));
+         pChannel->GetFloats(
+            buffer.data(), start, buffer.size(), FillFormat::fillZero, false);
+
+         // The content lane is deliberately rough and cheap: one confirmed
+         // 100-sample window per few screen pixels.  This single pass over the
+         // fetched buffer feeds both the content state and overlay-risk state.
+         for (const auto sample : buffer) {
+            const auto magnitude = std::abs(sample);
+            if (magnitude > trackPeak)
+               trackPeak = magnitude;
+         }
+      }
+
+      peak = std::max(peak, trackPeak);
+      if (trackPeak >= ContentTrackOffThreshold)
+         ++contributingTracks;
+      if (trackPeak >= ContentTrackOverlayThreshold)
+         ++overlayTracks;
+   }
+
+   ContentOverlayState overlay = ContentOverlayState::Off;
+   if (overlayTracks > 1)
+      overlay = ContentOverlayState::Overlay;
+   else if (contributingTracks > 1)
+      // More than one track is present, but not enough loud tracks to be a
+      // definite overlay; show it as an inaudible/low-level overlap.
+      overlay = ContentOverlayState::InaudibleOverlay;
+
+   return { ContentStateForPeak(peak), overlay };
+}
+
+void AppendContentTrackSegment(std::vector<ContentTrackSegment> &segments,
+   int x0, int x1, const ContentTrackAnalysis &analysis)
+{
+   if (x1 <= x0)
+      return;
+
+   if (!segments.empty()) {
+      auto &last = segments.back();
+      if (last.x1 == x0
+          && last.state == analysis.state
+          && last.overlay == analysis.overlay) {
+         last.x1 = x1;
+         return;
+      }
+   }
+
+   segments.push_back({ x0, x1, analysis.state, analysis.overlay });
+}
+
+std::vector<ContentTrackSegment> BuildContentTrackSegmentsRange(
+   const std::vector<std::shared_ptr<WaveTrack>> &tracks,
+   const ContentTrackRenderKey &key, int rangeStart, int rangeEnd,
+   uint64_t renderSerial)
+{
+   std::vector<ContentTrackSegment> segments;
+   if (rangeEnd <= rangeStart)
+      return segments;
+
+   ContentTrackAnalysis currentAnalysis;
+   auto segmentStart = rangeStart;
+   bool haveSegment = false;
+
+   for (auto x = rangeStart; x < rangeEnd; x += ContentTrackStepPixels) {
+      if (sContentTrackRender.generation.load(std::memory_order_relaxed)
+          != key.generation
+          || sContentTrackRender.renderSerial.load(std::memory_order_relaxed)
+          != renderSerial)
+         return {};
+
+      const auto time =
+         std::max(0.0, key.hpos + (x - key.leftOffset) / key.zoom);
+      const auto analysis = ClassifyContentWindow(tracks, time);
+
+      if (!haveSegment) {
+         currentAnalysis = analysis;
+         segmentStart = x;
+         haveSegment = true;
+      }
+      else if (!SameContentAnalysis(analysis, currentAnalysis)) {
+         AppendContentTrackSegment(
+            segments, segmentStart, x, currentAnalysis);
+         currentAnalysis = analysis;
+         segmentStart = x;
+      }
+   }
+
+   if (haveSegment)
+      AppendContentTrackSegment(
+         segments, segmentStart, rangeEnd, currentAnalysis);
+
+   return segments;
+}
+
+unsigned ContentTrackWorkerCount(int width)
+{
+   const auto steps =
+      std::max(1, (width + ContentTrackStepPixels - 1) / ContentTrackStepPixels);
+   const auto wanted = ContentTrackPool().Size();
+   return std::max(1u, std::min<unsigned>(wanted, steps));
+}
+
+std::vector<ContentTrackSegment> BuildContentTrackSegments(
+   const std::vector<std::shared_ptr<WaveTrack>> &tracks,
+   const ContentTrackRenderKey &key, uint64_t renderSerial)
+{
+   std::vector<ContentTrackSegment> segments;
+   if (key.width <= key.leftOffset)
+      return segments;
+
+   const auto dataWidth = key.width - key.leftOffset;
+   const auto workerCount = ContentTrackWorkerCount(dataWidth);
+   if (workerCount == 1)
+      return BuildContentTrackSegmentsRange(
+         tracks, key, key.leftOffset, key.width, renderSerial);
+
+   std::vector<std::vector<ContentTrackSegment>> chunks(workerCount);
+   std::mutex doneMutex;
+   std::condition_variable doneCondition;
+   auto remaining = workerCount;
+   auto &pool = ContentTrackPool();
+
+   for (auto ii = 0u; ii < workerCount; ++ii) {
+      const auto chunkStart =
+         key.leftOffset + static_cast<int>((dataWidth * ii) / workerCount);
+      const auto chunkEnd =
+         key.leftOffset + static_cast<int>((dataWidth * (ii + 1)) / workerCount);
+
+      pool.Post([&, ii, chunkStart, chunkEnd] {
+         chunks[ii] = BuildContentTrackSegmentsRange(
+            tracks, key, chunkStart, chunkEnd, renderSerial);
+         {
+            std::lock_guard<std::mutex> lock{ doneMutex };
+            --remaining;
+         }
+         doneCondition.notify_one();
+      });
+   }
+
+   {
+      std::unique_lock<std::mutex> lock{ doneMutex };
+      doneCondition.wait(lock, [&] { return remaining == 0; });
+   }
+
+   for (auto &chunk : chunks) {
+      for (const auto &segment : chunk) {
+         AppendContentTrackSegment(
+            segments, segment.x0, segment.x1,
+            { segment.state, segment.overlay });
+      }
+   }
+
+   return segments;
+}
+
+void InvalidateContentTrackRender()
+{
+   sContentTrackRender.generation.fetch_add(1, std::memory_order_relaxed);
+   sContentTrackRender.renderSerial.fetch_add(1, std::memory_order_relaxed);
+   std::lock_guard<std::mutex> lock{ sContentTrackRender.mutex };
+   sContentTrackRender.hasReady = false;
+   sContentTrackRender.scheduled = false;
+}
+
+void DrawContentTrackSegment(wxDC &dc, ContentTrackState state,
+   const wxRect &contentRect, int x0, int x1)
+{
+   if (x1 <= x0)
+      return;
+
+   dc.SetPen(*wxTRANSPARENT_PEN);
+   dc.SetBrush(wxBrush(ContentTrackColor(state)));
+   dc.DrawRectangle(x0, contentRect.y, x1 - x0, contentRect.height);
+}
+
+void DrawContentOverlaySegment(wxDC &dc, ContentOverlayState state,
+   const wxRect &contentRect, int x0, int x1)
+{
+   if (x1 <= x0)
+      return;
+
+   dc.SetPen(*wxTRANSPARENT_PEN);
+   dc.SetBrush(wxBrush(ContentOverlayColor(state)));
+   dc.DrawRectangle(x0, contentRect.y, x1 - x0, contentRect.height);
+}
+
+wxBitmap MakeContentTrackBitmap(
+   const ContentTrackRenderKey &key,
+   const std::vector<ContentTrackSegment> &segments)
+{
+   wxBitmap bitmap{ key.width, key.height };
+   wxMemoryDC dc{ bitmap };
+
+   wxRect rect{ 0, 0, key.width, key.height };
+   const auto leftOffset = std::clamp(key.leftOffset, 0, key.width);
+   const wxRect labelRect{ 0, 0, leftOffset, key.height };
+   const wxRect contentRect{ leftOffset, 0, key.width - leftOffset, key.height };
+   const auto topHeight = std::max(1, contentRect.height / 2);
+   const wxRect contentTop{
+      contentRect.x, contentRect.y, contentRect.width, topHeight };
+   const wxRect contentBottom{
+      contentRect.x, contentRect.y + topHeight, contentRect.width,
+      contentRect.height - topHeight };
+   const auto labelTopHeight = std::max(1, labelRect.height / 2);
+
+   dc.SetPen(*wxTRANSPARENT_PEN);
+   dc.SetBrush(wxBrush(wxColour(36, 36, 40)));
+   dc.DrawRectangle(labelRect);
+   dc.SetTextForeground(wxColour(245, 245, 245));
+   dc.DrawText(_("Content"), labelRect.x + 4, labelRect.y + 2);
+   dc.DrawText(_("Overlay"), labelRect.x + 4, labelRect.y + labelTopHeight + 2);
+   dc.DrawText(ContentTrackEnabled.Read() ? _("Disable") : _("Enable"),
+      std::max(labelRect.x + 4, labelRect.GetRight() - 62),
+      labelRect.y + labelTopHeight + 2);
+
+   dc.SetBrush(wxBrush(wxColour(70, 70, 74)));
+   dc.DrawRectangle(contentRect);
+
+   for (const auto &segment : segments) {
+      DrawContentTrackSegment(dc, segment.state, contentTop,
+         std::max(segment.x0, contentTop.x),
+         std::min(segment.x1, contentTop.GetRight() + 1));
+      DrawContentOverlaySegment(dc, segment.overlay, contentBottom,
+         std::max(segment.x0, contentBottom.x),
+         std::min(segment.x1, contentBottom.GetRight() + 1));
+   }
+
+   dc.SetPen(wxPen(wxColour(10, 10, 10), 1));
+   dc.SetBrush(*wxTRANSPARENT_BRUSH);
+   dc.DrawRectangle(rect);
+   AColor::Line(dc, rect.x, rect.y + labelTopHeight,
+      rect.GetRight(), rect.y + labelTopHeight);
+   dc.SelectObject(wxNullBitmap);
+
+   return bitmap;
+}
+
+void StartContentTrackRender(TrackPanel &panel, const ContentTrackRenderKey &key)
+{
+   const auto trackList = panel.GetTracks();
+   const auto viewInfo = panel.GetViewInfo();
+   if (!trackList || !viewInfo)
+      return;
+
+   bool shouldStartDebounce = false;
+   {
+      std::lock_guard<std::mutex> lock{ sContentTrackRender.mutex };
+      if ((sContentTrackRender.hasReady
+             && sContentTrackRender.readyKey == key)
+          || (sContentTrackRender.running
+             && sContentTrackRender.runningKey == key))
+         return;
+
+      // Repeated scroll/zoom paints update one pending key.  This avoids a
+      // sleeping-thread pileup while still cancelling obsolete active renders.
+      sContentTrackRender.renderSerial.fetch_add(1, std::memory_order_relaxed);
+      shouldStartDebounce = !sContentTrackRender.scheduled;
+      sContentTrackRender.scheduled = true;
+      sContentTrackRender.scheduledKey = key;
+   }
+
+   if (!shouldStartDebounce)
+      return;
+
+   std::vector<std::shared_ptr<WaveTrack>> waveTracks;
+   for (auto track : trackList->Any<WaveTrack>())
+      waveTracks.push_back(track->SharedPointer<WaveTrack>());
+
+   wxWeakRef<TrackPanel> weakPanel{ &panel };
+   std::thread{
+      [waveTracks = std::move(waveTracks), weakPanel] {
+         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+         ContentTrackRenderKey key;
+         uint64_t renderSerial{};
+         {
+            std::lock_guard<std::mutex> lock{ sContentTrackRender.mutex };
+            if (!sContentTrackRender.scheduled
+                || sContentTrackRender.generation.load(std::memory_order_relaxed)
+                   != sContentTrackRender.scheduledKey.generation)
+               return;
+            key = sContentTrackRender.scheduledKey;
+            sContentTrackRender.scheduled = false;
+            sContentTrackRender.running = true;
+            sContentTrackRender.runningKey = key;
+            renderSerial =
+               sContentTrackRender.renderSerial.load(std::memory_order_relaxed);
+         }
+
+         auto segments = BuildContentTrackSegments(waveTracks, key, renderSerial);
+
+         const auto currentGeneration =
+            sContentTrackRender.generation.load(std::memory_order_relaxed);
+         const auto currentRenderSerial =
+            sContentTrackRender.renderSerial.load(std::memory_order_relaxed);
+         {
+            std::lock_guard<std::mutex> lock{ sContentTrackRender.mutex };
+            sContentTrackRender.running = false;
+            if (currentGeneration != key.generation
+                || currentRenderSerial != renderSerial)
+               return;
+         }
+
+         if (wxTheApp) {
+            wxTheApp->CallAfter(
+               [weakPanel, key, renderSerial, segments = std::move(segments)] {
+               if (sContentTrackRender.generation.load(std::memory_order_relaxed)
+                   != key.generation
+                   || sContentTrackRender.renderSerial.load(std::memory_order_relaxed)
+                   != renderSerial)
+                  return;
+
+               auto bitmap = MakeContentTrackBitmap(key, segments);
+               {
+                  std::lock_guard<std::mutex> lock{ sContentTrackRender.mutex };
+                  if (sContentTrackRender.generation.load(std::memory_order_relaxed)
+                      != key.generation
+                      || sContentTrackRender.renderSerial.load(std::memory_order_relaxed)
+                      != renderSerial)
+                     return;
+                  sContentTrackRender.readyKey = key;
+                  sContentTrackRender.bitmap =
+                     std::make_shared<wxBitmap>(std::move(bitmap));
+                  sContentTrackRender.hasReady = true;
+               }
+
+               if (weakPanel)
+                  weakPanel->Refresh(false);
+            });
+         }
+      }
+   }.detach();
+}
+
+void DrawContentTrack(TrackPanel &panel, wxDC &dc, const wxRect &rect)
+{
+   if (!ShowContentTrack.Read())
+      return;
+
+   const auto viewInfo = panel.GetViewInfo();
+   const auto project = panel.GetProject();
+   if (!viewInfo || !project || rect.width <= 0 || rect.height <= 0)
+      return;
+
+   const auto leftOffset =
+      std::clamp(viewInfo->GetLeftOffset(), rect.x, rect.GetRight() + 1);
+   if (rect.GetRight() + 1 - leftOffset <= 0)
+      return;
+
+   if (!ContentTrackEnabled.Read()) {
+      const wxRect labelRect{ rect.x, rect.y, leftOffset - rect.x, rect.height };
+      const wxRect contentRect{
+         leftOffset, rect.y, rect.GetRight() + 1 - leftOffset, rect.height };
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(wxColour(36, 36, 40)));
+      dc.DrawRectangle(labelRect);
+      dc.SetTextForeground(wxColour(245, 245, 245));
+      dc.DrawText(_("Content"), labelRect.x + 4, labelRect.y + 2);
+      dc.DrawText(_("Enable"),
+         std::max(labelRect.x + 4, labelRect.GetRight() - 62),
+         labelRect.y + rect.height / 2 + 2);
+      dc.SetBrush(wxBrush(wxColour(58, 58, 62)));
+      dc.DrawRectangle(contentRect);
+      dc.SetPen(wxPen(wxColour(10, 10, 10), 1));
+      dc.SetBrush(*wxTRANSPARENT_BRUSH);
+      dc.DrawRectangle(rect);
+      return;
+   }
+
+   const ContentTrackRenderKey key{
+      project, viewInfo->hpos, viewInfo->GetZoom(), leftOffset - rect.x,
+      rect.width, rect.height,
+      sContentTrackRender.generation.load(std::memory_order_relaxed)
+   };
+
+   std::shared_ptr<wxBitmap> bitmap;
+   bool hasReady = false;
+   {
+      std::lock_guard<std::mutex> lock{ sContentTrackRender.mutex };
+      hasReady = sContentTrackRender.hasReady
+         && sContentTrackRender.readyKey == key;
+      if (hasReady)
+         bitmap = sContentTrackRender.bitmap;
+   }
+
+   if (hasReady && bitmap && bitmap->IsOk()) {
+      wxMemoryDC source{ *bitmap };
+      dc.Blit(rect.x, rect.y, rect.width, rect.height, &source, 0, 0);
+      source.SelectObject(wxNullBitmap);
+   }
+   else {
+      const wxRect labelRect{ rect.x, rect.y, leftOffset - rect.x, rect.height };
+      const wxRect contentRect{
+         leftOffset, rect.y, rect.GetRight() + 1 - leftOffset, rect.height };
+      dc.SetPen(*wxTRANSPARENT_PEN);
+      dc.SetBrush(wxBrush(wxColour(36, 36, 40)));
+      dc.DrawRectangle(labelRect);
+      dc.SetTextForeground(wxColour(245, 245, 245));
+      dc.DrawText(_("Content"), labelRect.x + 4, labelRect.y + 2);
+      dc.DrawText(ContentTrackEnabled.Read() ? _("Disable") : _("Enable"),
+         std::max(labelRect.x + 4, labelRect.GetRight() - 62),
+         labelRect.y + rect.height / 2 + 2);
+      dc.SetBrush(wxBrush(wxColour(70, 70, 74)));
+      dc.DrawRectangle(contentRect);
+      if (ContentTrackEnabled.Read())
+         StartContentTrackRender(panel, key);
+
+      dc.SetPen(wxPen(wxColour(10, 10, 10), 1));
+      dc.SetBrush(*wxTRANSPARENT_BRUSH);
+      dc.DrawRectangle(rect);
+   }
+}
+
+class ContentTrackResizeHandle final : public UIHandle
+{
+public:
+   explicit ContentTrackResizeHandle(int y)
+      : mMouseClickY{ y }
+      , mInitialHeight{
+           std::clamp(ContentTrackHeightSetting.Read(), 24, 240)
+        }
+   {}
+
+   Result Click(
+      const TrackPanelMouseEvent &, AudacityProject *) override
+   {
+      return RefreshCode::RefreshNone;
+   }
+
+   Result Drag(
+      const TrackPanelMouseEvent &event, AudacityProject *) override
+   {
+      const auto delta = event.event.m_y - mMouseClickY;
+      const auto height = std::clamp(mInitialHeight + delta, 24, 240);
+      ContentTrackHeightSetting.Write(height);
+      InvalidateContentTrackRender();
+      return RefreshCode::RefreshAll | RefreshCode::FixScrollbars;
+   }
+
+   HitTestPreview Preview(
+      const TrackPanelMouseState &, AudacityProject *) override
+   {
+      static wxCursor resizeCursor{ wxCURSOR_SIZENS };
+      return { XO("Click and drag to resize the content track."), &resizeCursor };
+   }
+
+   Result Release(
+      const TrackPanelMouseEvent &, AudacityProject *, wxWindow *) override
+   {
+      gPrefs->Flush();
+      return RefreshCode::RefreshAll | RefreshCode::FixScrollbars;
+   }
+
+   Result Cancel(AudacityProject *) override
+   {
+      ContentTrackHeightSetting.Write(mInitialHeight);
+      InvalidateContentTrackRender();
+      return RefreshCode::RefreshAll | RefreshCode::FixScrollbars;
+   }
+
+   std::shared_ptr<const Track> FindTrack() const override { return {}; }
+
+private:
+   int mMouseClickY{};
+   int mInitialHeight{};
+};
+
+int ContentTrackIndexForY(TrackPanel &panel, int y)
+{
+   const auto viewInfo = panel.GetViewInfo();
+   const auto tracks = panel.GetTracks();
+   if (!viewInfo || !tracks)
+      return 0;
+
+   auto absoluteY = y + viewInfo->vpos - kTopMargin;
+   auto index = 0;
+   auto yy = 0;
+   for (const auto pTrack : *tracks) {
+      wxCoord height = 0;
+      for (auto pChannel : pTrack->Channels())
+         height += ChannelView::Get(*pChannel).GetHeight();
+
+      if (absoluteY < yy + height / 2)
+         return index;
+
+      yy += height;
+      ++index;
+   }
+   return index;
+}
+
+class ContentTrackMoveHandle final : public UIHandle
+{
+public:
+   Result Click(
+      const TrackPanelMouseEvent &, AudacityProject *) override
+   {
+      return RefreshCode::RefreshNone;
+   }
+
+   Result Drag(
+      const TrackPanelMouseEvent &event, AudacityProject *project) override
+   {
+      auto &panel = TrackPanel::Get(*project);
+      const auto index = ContentTrackIndexForY(panel, event.event.m_y);
+      if (index != ContentTrackIndexSetting.Read()) {
+         ContentTrackIndexSetting.Write(index);
+         InvalidateContentTrackRender();
+         return RefreshCode::RefreshAll | RefreshCode::FixScrollbars;
+      }
+      return RefreshCode::RefreshNone;
+   }
+
+   HitTestPreview Preview(
+      const TrackPanelMouseState &, AudacityProject *) override
+   {
+      static wxCursor moveCursor{ wxCURSOR_SIZING };
+      return { XO("Click and drag to move the content track."), &moveCursor };
+   }
+
+   Result Release(
+      const TrackPanelMouseEvent &, AudacityProject *, wxWindow *) override
+   {
+      gPrefs->Flush();
+      return RefreshCode::RefreshAll | RefreshCode::FixScrollbars;
+   }
+
+   Result Cancel(AudacityProject *) override
+   {
+      return RefreshCode::RefreshAll | RefreshCode::FixScrollbars;
+   }
+
+   std::shared_ptr<const Track> FindTrack() const override { return {}; }
+};
+
+class ContentTrackEnableHandle final : public UIHandle
+{
+public:
+   Result Click(
+      const TrackPanelMouseEvent &, AudacityProject *) override
+   {
+      ContentTrackEnabled.Toggle();
+      gPrefs->Flush();
+      InvalidateContentTrackRender();
+      return RefreshCode::RefreshAll;
+   }
+
+   Result Drag(
+      const TrackPanelMouseEvent &, AudacityProject *) override
+   {
+      return RefreshCode::RefreshNone;
+   }
+
+   HitTestPreview Preview(
+      const TrackPanelMouseState &, AudacityProject *) override
+   {
+      static wxCursor cursor{ wxCURSOR_HAND };
+      return {
+         ContentTrackEnabled.Read()
+            ? XO("Disable content track updates.")
+            : XO("Enable content track updates."),
+         &cursor
+      };
+   }
+
+   Result Release(
+      const TrackPanelMouseEvent &, AudacityProject *, wxWindow *) override
+   {
+      return RefreshCode::RefreshNone;
+   }
+
+   Result Cancel(AudacityProject *) override
+   {
+      return RefreshCode::RefreshNone;
+   }
+
+   std::shared_ptr<const Track> FindTrack() const override { return {}; }
+};
+
+struct ContentTrackCell final : CommonTrackPanelCell {
+   std::vector< UIHandlePtr > HitTest(
+      const TrackPanelMouseState &st, const AudacityProject *pProject) override
+   {
+      (void)pProject;
+      const auto leftOffset = st.rect.x + kTrackInfoWidth;
+      if (st.state.m_x < leftOffset
+          && st.state.m_x >= leftOffset - 68
+          && st.state.m_y >= st.rect.y + st.rect.height / 2) {
+         auto result = std::make_shared<ContentTrackEnableHandle>();
+         result = AssignUIHandlePtr(mEnableHandle, result);
+         return { result };
+      }
+
+      if (st.state.m_y >= st.rect.GetBottom() - kTrackSeparatorThickness - 3) {
+         auto result =
+            std::make_shared<ContentTrackResizeHandle>(st.state.m_y);
+         result = AssignUIHandlePtr(mResizeHandle, result);
+         return { result };
+      }
+
+      auto result = std::make_shared<ContentTrackMoveHandle>();
+      result = AssignUIHandlePtr(mMoveHandle, result);
+      return { result };
+   }
+
+   std::shared_ptr< Track > DoFindTrack() override { return {}; }
+
+   void Draw(
+      TrackPanelDrawingContext &context,
+      const wxRect &rect, unsigned iPass ) override
+   {
+      if (iPass == TrackArtist::PassTracks)
+         DrawContentTrack(*TrackArtist::Get(context)->parent, context.dc, rect);
+
+      if (iPass == TrackArtist::PassBorders) {
+         context.dc.SetBrush(*wxTRANSPARENT_BRUSH);
+         context.dc.SetPen(*wxBLACK_PEN);
+         context.dc.DrawRectangle(rect);
+      }
+   }
+
+   static std::shared_ptr<ContentTrackCell> Instance()
+   {
+      static auto instance = std::make_shared< ContentTrackCell >();
+      return instance;
+   }
+
+   std::weak_ptr<ContentTrackResizeHandle> mResizeHandle;
+   std::weak_ptr<ContentTrackMoveHandle> mMoveHandle;
+   std::weak_ptr<ContentTrackEnableHandle> mEnableHandle;
+};
+}
 
 static_assert( kVerticalPadding == kTopMargin + kBottomMargin );
 static_assert( kTrackInfoTitleHeight + kTrackInfoTitleExtra == kAffordancesAreaHeight, "Drag bar is misaligned with the menu button");
@@ -307,11 +1186,15 @@ TrackPanel::TrackPanel(wxWindow * parent, wxWindowID id,
    // Register for tracklist updates
    mTrackListSubscription = PendingTracks::Get(*GetProject())
    .Subscribe([this](const TrackListEvent &event){
+      InvalidateContentTrackRender();
       switch (event.mType) {
+      case TrackListEvent::SELECTION_CHANGE:
+         UpdateSelectedTrackMultimode(); break;
       case TrackListEvent::RESIZING:
       case TrackListEvent::ADDITION:
          OnTrackListResizing(event); break;
       case TrackListEvent::DELETION:
+         UpdateSelectedTrackMultimode();
          OnTrackListDeletion(); break;
       default:
          break;
@@ -345,11 +1228,69 @@ TrackPanel::TrackPanel(wxWindow * parent, wxWindowID id,
       .Subscribe([this](auto&){ Refresh(false); });
 
    UpdatePrefs();
+   UpdateSelectedTrackMultimode();
+}
+
+void TrackPanel::UpdateSelectedTrackMultimode()
+{
+   auto &savedViews = sSelectedTrackMultimode[this];
+
+   auto restore = [this, &savedViews](SelectedTrackViewMap::iterator it) {
+      if (auto track = it->second.track.lock()) {
+         auto &view = WaveChannelView::GetFirst(*track);
+         view.SetMultiView(it->second.multiView);
+         view.RestorePlacements(it->second.placements);
+         UpdateVRuler(track.get());
+      }
+      return savedViews.erase(it);
+   };
+
+   if (!SetSelectedTrackMultimode.Read()) {
+      for (auto it = savedViews.begin(); it != savedViews.end(); )
+         it = restore(it);
+      Refresh(false);
+      return;
+   }
+
+   for (auto it = savedViews.begin(); it != savedViews.end(); ) {
+      auto track = it->second.track.lock();
+      if (!track || !track->GetSelected())
+         it = restore(it);
+      else
+         ++it;
+   }
+
+   bool changed = false;
+   for (auto track : mTracks->Selected<WaveTrack>()) {
+      auto &view = WaveChannelView::GetFirst(*track);
+      auto displays = view.GetDisplays();
+      auto &entry = savedViews[track->GetId()];
+      if (!entry.track.expired())
+         continue;
+
+      entry.track = track->SharedPointer<WaveTrack>();
+      entry.multiView = view.GetMultiView();
+      entry.placements = view.SavePlacements();
+
+      // Preserve the user's top view while temporarily showing both waveform
+      // and spectrum for the selected track.
+      const auto display = displays.empty()
+         ? WaveChannelViewConstants::Waveform
+         : displays.begin()->id;
+      view.SetMultiView(true);
+      view.SetDisplay(display, false);
+      UpdateVRuler(track);
+      changed = true;
+   }
+
+   if (changed)
+      Refresh(false);
 }
 
 
 TrackPanel::~TrackPanel()
 {
+   sSelectedTrackMultimode.erase(this);
    mTimer.Stop();
 
    // This can happen if a label is being edited and the user presses
@@ -516,6 +1457,18 @@ void TrackPanel::OnPaint(wxPaintEvent & /* event */)
       {
          // Copy full, possibly clipped, damage rectangle
          RepairBitmap(dc, box.x, box.y, box.width, box.height);
+      }
+
+      if (const auto sentinel =
+             ProjectAudioManager::Get(*GetProject()).GetSentinelPlaybackPosition()) {
+         const auto x = mViewInfo->TimeToPosition(
+            *sentinel, mViewInfo->GetLeftOffset());
+         if (x >= 0 && x < GetSize().GetWidth()) {
+            // Ctrl-click places a persistent orange play-over anchor; draw it
+            // over the whole track panel so it reads as one global marker.
+            dc.SetPen(wxPen(wxColour(255, 128, 0), 1));
+            AColor::Line(dc, x, 0, x, GetSize().GetHeight());
+         }
       }
 
       // Done with the clipped DC
@@ -829,8 +1782,6 @@ void TrackPanel::OnAudioIO(AudioIOEvent evt)
    // Some hit tests want to change their cursor to and from the ban symbol
    CallAfter( [this]{ CellularPanel::HandleCursorForPresentMouseState(); } );
 }
-
-#include "TrackPanelDrawingContext.h"
 
 /// Draw the actual track areas.  We only draw the borders
 /// and the little buttons and menues and whatnot here, the
@@ -1450,6 +2401,28 @@ struct Subgroup final : TrackPanelGroup {
          refinement.emplace_back( yy, EmptyCell::Instance() ),
          yy += kTopMargin;
 
+      const auto showContentTrack = ShowContentTrack.Read();
+      const auto contentHeight =
+         std::clamp(ContentTrackHeightSetting.Read(), 24, 240);
+      int trackCount = 0;
+      for (const auto pTrack : tracks) {
+         (void)pTrack;
+         ++trackCount;
+      }
+      const auto contentIndex =
+         std::clamp(ContentTrackIndexSetting.Read(), 0, trackCount);
+
+      auto addContentTrack = [&] {
+         if (showContentTrack) {
+            refinement.emplace_back(yy, ContentTrackCell::Instance());
+            yy += contentHeight;
+         }
+      };
+
+      if (contentIndex == 0)
+         addContentTrack();
+
+      int trackIndex = 0;
       for (const auto pTrack : tracks) {
          wxCoord height = 0;
          for (auto pChannel : pTrack->Channels()) {
@@ -1461,6 +2434,9 @@ struct Subgroup final : TrackPanelGroup {
                pTrack->SharedPointer(), viewInfo.GetLeftOffset())
          );
          yy += height;
+         ++trackIndex;
+         if (contentIndex == trackIndex)
+            addContentTrack();
       }
 
       refinement.emplace_back(std::max(0, yy), mPanel.GetBackgroundCell());

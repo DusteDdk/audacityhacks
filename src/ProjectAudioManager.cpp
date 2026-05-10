@@ -43,6 +43,8 @@ Paul Licameli split from ProjectManager.cpp
 #include "WaveTrack.h"
 #include "tracks/ui/Scrubbing.h"
 #include "tracks/ui/ChannelView.h"
+
+#include <cmath>
 #include "widgets/MeterPanelBase.h"
 #include "AudacityMessageBox.h"
 
@@ -518,6 +520,13 @@ void ProjectAudioManager::Stop(bool stopStream /* = true*/)
    auto cleanup = finally( [&]{
       projectAudioManager.SetStopping( false );
    } );
+
+   const auto token = ProjectAudioIO::Get(*project).GetAudioIOToken();
+   if (stopStream && gAudioIO->IsStreamActive(token)) {
+      const auto time = gAudioIO->GetStreamTime();
+      if (std::isfinite(time) && time >= 0.0)
+         projectAudioManager.SetLastKnownPlaybackPosition(time);
+   }
 
    if (stopStream && gAudioIO->IsBusy()) {
       // flag that we are stopping
@@ -1083,6 +1092,12 @@ void ProjectAudioManager::OnAudioIOStartRecording()
 {
    // Auto-save was done here before, but it is unnecessary, provided there
    // are sufficient autosaves when pushing or modifying undo states.
+}
+
+void ProjectAudioManager::OnAudioIOStopPlayback(double time)
+{
+   if (std::isfinite(time) && time >= 0.0)
+      SetLastKnownPlaybackPosition(time);
 }
 
 // This is called after recording has stopped and all tracks have flushed.

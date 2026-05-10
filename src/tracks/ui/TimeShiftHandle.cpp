@@ -13,6 +13,7 @@ Paul Licameli split from TrackPanel.cpp
 #include "AColor.h"
 #include "../../HitTestResult.h"
 #include "ProjectAudioIO.h"
+#include "../../ProjectAudioManager.h"
 #include "ProjectHistory.h"
 #include "../../ProjectSettings.h"
 #include "../../RefreshCode.h"
@@ -435,6 +436,7 @@ double ClipMoveState::DoSlideHorizontal(double desiredSlideAmount)
 
 namespace {
 SnapPointArray FindCandidates(
+   const AudacityProject &project,
    const TrackList &tracks, const ClipMoveState::ShifterMap &shifters)
 {
    // Compare with the other function FindCandidates in Snap
@@ -450,6 +452,12 @@ SnapPointArray FindCandidates(
             candidates.emplace_back(interval->End(), &track);
       }
    }
+
+   // The sentinel behaves like a ruler item: every track may snap to it.
+   if (const auto sentinel =
+      ProjectAudioManager::Get(project).GetSentinelPlaybackPosition())
+      candidates.emplace_back(*sentinel);
+
    return candidates;
 }
 }
@@ -511,7 +519,7 @@ UIHandle::Result TimeShiftHandle::Click(
    mClipMoveState.mMouseClickX = event.m_x;
    mSnapManager =
    std::make_shared<SnapManager>(*trackList.GetOwner(),
-       FindCandidates( trackList, mClipMoveState.shifters ),
+       FindCandidates( *pProject, trackList, mClipMoveState.shifters ),
        viewInfo);
    mClipMoveState.snapLeft = -1;
    mClipMoveState.snapRight = -1;

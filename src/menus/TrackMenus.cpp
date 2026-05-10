@@ -35,6 +35,8 @@
 
 #include <wx/combobox.h>
 
+extern BoolSetting SetSelectedTrackMultimode;
+
 #ifdef EXPERIMENTAL_SCOREALIGN
 #include "../effects/ScoreAlignDialog.h"
 #include "audioreader.h"
@@ -925,6 +927,12 @@ void OnSyncLock(const CommandContext &context)
    trackPanel.Refresh(false);
 }
 
+void OnSetSelectedTrackMultimode(const CommandContext &context)
+{
+   SetSelectedTrackMultimode.Toggle();
+   TrackPanel::Get(context.project).UpdateSelectedTrackMultimode();
+}
+
 ///The following methods operate controls on specified tracks,
 ///This will pop up the track panning dialog for specified track
 void OnTrackPan(const CommandContext &context)
@@ -1255,6 +1263,10 @@ auto TracksMenu()
       ),
 
       Section( "",
+         Command( wxT("SetSelectedTrackMultimode"),
+            XXO("Set selected track multimode"),
+            OnSetSelectedTrackMultimode, AlwaysEnabledFlag,
+            Options{}.CheckTest(SetSelectedTrackMultimode) ),
          Command( wxT("SyncLock"), XXO("Keep tracks synchronized (Sync-Lock)"),
             OnSyncLock, AlwaysEnabledFlag,
             Options{ wxT("F5") }.CheckTest(SyncLockTracks) )

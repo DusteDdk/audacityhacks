@@ -12,6 +12,7 @@
 #define __AUDACITY_SELECT_UTILITIES__
 
 class AudacityProject;
+class BoolSetting;
 class Track;
 class TranslatableString;
 
@@ -28,6 +29,13 @@ AUDACITY_DLL_API void DoListSelection(AudacityProject &project, Track &t,
 AUDACITY_DLL_API void DoSelectAll( AudacityProject &project );
 AUDACITY_DLL_API void DoSelectAllAudio( AudacityProject &project );
 AUDACITY_DLL_API void DoSelectSomething( AudacityProject &project );
+
+extern AUDACITY_DLL_API BoolSetting AdjustSelectionToZeroCrossOnSelection;
+extern AUDACITY_DLL_API BoolSetting AutoZeroCrossSelectionOnSelectedOnly;
+AUDACITY_DLL_API bool AdjustSelectionToZeroCrossing(
+   AudacityProject &project, bool includeSyncLockedTracks, bool showError);
+AUDACITY_DLL_API bool MaybeAdjustSelectionToZeroCrossing(
+   AudacityProject &project, bool showError);
 
 AUDACITY_DLL_API void ActivatePlayRegion(AudacityProject &project);
 AUDACITY_DLL_API void InactivatePlayRegion(AudacityProject &project);

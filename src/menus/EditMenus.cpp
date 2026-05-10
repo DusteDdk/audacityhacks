@@ -16,6 +16,7 @@
 #include "TempoChange.h"
 #include "../TrackPanel.h"
 #include "TrackFocus.h"
+#include "TrackSpectrumTransformer.h"
 #include "UndoManager.h"
 #include "ViewInfo.h"
 #include "WaveTrack.h"
@@ -35,6 +36,11 @@
 #include "Sequence.h"
 #include "UserException.h"
 #include "Viewport.h"
+
+#include "FFT.h"
+
+#include <algorithm>
+#include <cmath>
 
 #include <wx/clipbrd.h>
 #include <wx/frame.h>
@@ -175,6 +181,127 @@ bool HasHiddenData(const TrackList& trackList)
       [](const WaveTrack *pTrack){
          return WaveTrackUtilities::HasHiddenData(*pTrack);
    });
+}
+
+bool HasSpectralSelection(const AudacityProject &project)
+{
+   const auto &selectedRegion = ViewInfo::Get(project).selectedRegion;
+   return selectedRegion.f0() != SelectedRegion::UndefinedFrequency ||
+      selectedRegion.f1() != SelectedRegion::UndefinedFrequency;
+}
+
+std::pair<double, double> GetSpectralDimFrequencyRange(
+   const SelectedRegion &selectedRegion, const WaveTrack &track)
+{
+   const auto nyquist = track.GetRate() / 2.0;
+   auto f0 = selectedRegion.f0() == SelectedRegion::UndefinedFrequency
+      ? 0.0
+      : selectedRegion.f0();
+   auto f1 = selectedRegion.f1() == SelectedRegion::UndefinedFrequency
+      ? nyquist
+      : selectedRegion.f1();
+
+   // Frequency selections clipped to the spectrogram edges use undefined
+   // bounds; resolve them to actual filter edges before processing.
+   f0 = std::clamp(f0, 0.0, nyquist);
+   f1 = std::clamp(f1, 0.0, nyquist);
+   return { f0, f1 };
+}
+
+double SpectralDimGain(double frequency, double f0, double f1)
+{
+   constexpr double outerTransitionHz = 10.0;
+   constexpr double innerTransitionHz = 25.0;
+   constexpr double dimDb = -2.0;
+   const auto fullGain = std::pow(10.0, dimDb / 20.0);
+
+   const auto lowerStart = std::max(0.0, f0 - outerTransitionHz);
+   const auto lowerFull = f0 + innerTransitionHz;
+   const auto upperFull = f1 - innerTransitionHz;
+   const auto upperEnd = f1 + outerTransitionHz;
+
+   if (frequency < lowerStart || frequency > upperEnd)
+      return 1.0;
+
+   // Ramp in from 10 Hz below the spectral selection and reach the full
+   // 2 dB dip 25 Hz inside it; mirror that shape at the upper boundary.
+   const auto lowerAmount = lowerFull <= lowerStart
+      ? 1.0
+      : std::clamp(
+         (frequency - lowerStart) / (lowerFull - lowerStart), 0.0, 1.0);
+   const auto upperAmount = upperEnd <= upperFull
+      ? 1.0
+      : std::clamp(
+         (upperEnd - frequency) / (upperEnd - upperFull), 0.0, 1.0);
+   const auto amount = std::min(lowerAmount, upperAmount);
+   return 1.0 + (fullGain - 1.0) * amount;
+}
+
+class SpectralDimTransformer final : public TrackSpectrumTransformer
+{
+public:
+   SpectralDimTransformer(
+      WaveChannel *outputChannel, double rate, double f0, double f1)
+      : TrackSpectrumTransformer{
+           outputChannel, true, eWinFuncHann, eWinFuncHann,
+           4096, 4, true, true}
+      , mRate{ rate }
+      , mF0{ f0 }
+      , mF1{ f1 }
+   {
+   }
+
+   static bool ProcessWindow(SpectrumTransformer &transformer)
+   {
+      auto &self = static_cast<SpectralDimTransformer&>(transformer);
+      auto &record = self.Nth(0);
+      const auto lastBin = self.mSpectrumSize - 1;
+
+      // SpectrumTransformer stores DC in real[0] and Nyquist in imag[0];
+      // the bins between them have normal real/imaginary pairs.
+      for (size_t bin = 0; bin <= lastBin; ++bin) {
+         const auto frequency =
+            (bin == lastBin)
+               ? self.mRate / 2.0
+               : bin * self.mRate / self.mWindowSize;
+         const auto gain =
+            static_cast<float>(SpectralDimGain(frequency, self.mF0, self.mF1));
+
+         if (gain == 1.0f)
+            continue;
+         if (bin == 0)
+            record.mRealFFTs[0] *= gain;
+         else if (bin == lastBin)
+            record.mImagFFTs[0] *= gain;
+         else {
+            record.mRealFFTs[bin] *= gain;
+            record.mImagFFTs[bin] *= gain;
+         }
+      }
+
+      return true;
+   }
+
+private:
+   double mRate;
+   double mF0;
+   double mF1;
+};
+
+bool ProcessSpectralDimChannel(
+   const WaveChannel &channel, WaveChannel &outputChannel,
+   double t0, double t1, double f0, double f1)
+{
+   const auto start = channel.TimeToLongSamples(t0);
+   const auto end = channel.TimeToLongSamples(t1);
+   const auto len = end - start;
+   if (len <= 0)
+      return true;
+
+   SpectralDimTransformer transformer{
+      &outputChannel, channel.GetTrack().GetRate(), f0, f1};
+   return transformer.Process(
+      SpectralDimTransformer::ProcessWindow, channel, 1, start, len);
 }
 
 // Menu handler functions
@@ -839,6 +966,54 @@ void OnSilence(const CommandContext &context)
       XC("Silence", "command"));
 }
 
+void OnSpectralDim(const CommandContext &context)
+{
+   auto &project = context.project;
+   auto &tracks = TrackList::Get(project);
+   const auto &selectedRegion = ViewInfo::Get(project).selectedRegion;
+
+   if (selectedRegion.isPoint() || !HasSpectralSelection(project))
+      return;
+
+   bool changed = false;
+   for (auto track : tracks.Selected<WaveTrack>()) {
+      const auto t0 =
+         std::max(selectedRegion.t0(), track->GetStartTime());
+      const auto t1 =
+         std::min(selectedRegion.t1(), track->GetEndTime());
+      if (t1 <= t0)
+         continue;
+
+      auto tempTrack = track->EmptyCopy();
+      auto output = tempTrack->Channels().begin();
+      auto processed = sampleCount{ 0 };
+      const auto [f0, f1] = GetSpectralDimFrequencyRange(
+         selectedRegion, *track);
+      if (f1 <= f0)
+         continue;
+
+      for (auto channel : track->Channels()) {
+         const auto start = channel->TimeToLongSamples(t0);
+         const auto end = channel->TimeToLongSamples(t1);
+         processed = std::max(processed, end - start);
+         if (!ProcessSpectralDimChannel(
+               *channel, **output++, t0, t1, f0, f1))
+            return;
+      }
+
+      tempTrack->Flush();
+      TrackSpectrumTransformer::PostProcess(*tempTrack, processed);
+      track->ClearAndPaste(t0, t1, *tempTrack, true, true);
+      changed = true;
+   }
+
+   if (changed) {
+      ProjectHistory::Get(project).PushState(
+         XO("Dimmed spectral selection"),
+         XO("Spectral dim"));
+   }
+}
+
 void OnTrim(const CommandContext &context)
 {
    auto &project = context.project;
@@ -1116,6 +1291,15 @@ const ReservedCommandFlag
    CommandFlagOptions{}.DisableDefaultMessage()
 }; return flag; }
 
+const ReservedCommandFlag
+&SpectralSelectionFlag() { static ReservedCommandFlag flag {
+   [](const AudacityProject &project)
+   {
+      return HasSpectralSelection(project);
+   },
+   CommandFlagOptions{}.DisableDefaultMessage()
+}; return flag; }
+
 using namespace MenuRegistry;
 auto EditMenu()
 {
@@ -1194,6 +1378,10 @@ auto EditMenu()
                   Command( wxT("Silence"), XXO("Silence Audi&o"), OnSilence,
                      AudioIONotBusyFlag() | TimeSelectedFlag() | WaveTracksSelectedFlag(),
                      wxT("Ctrl+L") ),
+                  Command( wxT("SpectralDim"), XXO("Spectral dim"), OnSpectralDim,
+                     AudioIONotBusyFlag() | TimeSelectedFlag() |
+                        WaveTracksSelectedFlag() | SpectralSelectionFlag(),
+                     Options{ wxT("Shift+Delete") } ),
                   /* i18n-hint: (verb)*/
                   Command( wxT("Trim"), XXO("Tri&m Audio"), OnTrim,
                      AudioIONotBusyFlag() | TimeSelectedFlag() | WaveTracksSelectedFlag(),

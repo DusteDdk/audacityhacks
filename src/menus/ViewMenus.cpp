@@ -22,6 +22,8 @@
 
 #include "toolbars/ToolManager.h"
 
+extern BoolSetting ShowContentTrack;
+
 // private helper classes and functions
 namespace {
 
@@ -287,6 +289,18 @@ void OnShowRMS(const CommandContext &context)
    trackPanel.Refresh(false);
 }
 
+void OnShowContentTrack(const CommandContext &context)
+{
+   auto &project = context.project;
+   auto &trackPanel = TrackPanel::Get( project );
+
+   ShowContentTrack.Toggle();
+   gPrefs->Flush();
+
+   trackPanel.MakeParentRedrawScrollbars();
+   trackPanel.Refresh();
+}
+
 } // namespace
 
 // Menu definitions
@@ -344,7 +358,10 @@ auto ViewMenu()
             Options{}.CheckTest( ShowClippingPref() ) ),
          Command( wxT("ShowRMS"), XXO("Sho&w RMS in Waveform"),
             OnShowRMS, AlwaysEnabledFlag,
-            Options{}.CheckTest( ShowRMSPref() ) )
+            Options{}.CheckTest( ShowRMSPref() ) ),
+         Command( wxT("ShowContentTrack"), XXO("Show content track"),
+            OnShowContentTrack, AlwaysEnabledFlag,
+            Options{}.CheckTest( ShowContentTrack ) )
       )
    ) };
    return menu;

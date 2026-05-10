@@ -41,6 +41,11 @@ Paul Licameli split from TrackInfo.cpp
 #include "ViewInfo.h"
 #include "tracks/ui/ChannelView.h"
 
+namespace {
+const wxColour SyncLockActiveColour{ 0, 220, 0 };
+const wxColour SyncLockExcludedColour{ 220, 0, 0 };
+}
+
 #define RANGE(array) std::begin(array), std::end(array)
 using TCPLine = TrackInfo::TCPLine;
 using TCPLines = TrackInfo::TCPLines;
@@ -283,22 +288,37 @@ void CommonTrackInfo::SyncLockDrawFunction
   const wxRect &rect, const Track *pTrack )
 {
    auto dc = &context.dc;
-   bool syncLockSelected =
-      pTrack ? SyncLock::IsSyncLockSelected(*pTrack) : true;
+   if (pTrack && !SyncLock::IsSyncLockable(*pTrack))
+      return;
 
-   // Draw the sync-lock indicator if this track is in a sync-lock selected group.
-   if (syncLockSelected)
+   wxRect syncLockIconRect = rect;
+   GetSyncLockHorizontalBounds( rect, syncLockIconRect );
+
+   if (pTrack)
    {
-      wxRect syncLockIconRect = rect;
-	
-      GetSyncLockHorizontalBounds( rect, syncLockIconRect );
-      wxBitmap syncLockBitmap(theTheme.Image(bmpSyncLockIcon));
-      // Icon is 12x12 and syncLockIconRect is 16x16.
-      dc->DrawBitmap(syncLockBitmap,
-                     syncLockIconRect.x + 3,
-                     syncLockIconRect.y + 2,
-                     true);
+      const auto pList = pTrack->GetOwner();
+      const auto project = pList ? pList->GetOwner() : nullptr;
+      const bool syncLockOn =
+         project && SyncLockState::Get(*project).IsSyncLocked();
+      const bool excluded = SyncLock::IsExcluded(*pTrack);
+
+      // Green means this track participates in active sync-lock; red means the
+      // user explicitly opted this track out while leaving the icon visible.
+      if (syncLockOn || excluded) {
+         dc->SetPen(*wxTRANSPARENT_PEN);
+         dc->SetBrush(wxBrush(excluded
+            ? SyncLockExcludedColour
+            : SyncLockActiveColour));
+         dc->DrawRectangle(syncLockIconRect);
+      }
    }
+
+   wxBitmap syncLockBitmap(theTheme.Image(bmpSyncLockIcon));
+   // Icon is 12x12 and syncLockIconRect is 16x16.
+   dc->DrawBitmap(syncLockBitmap,
+                  syncLockIconRect.x + 3,
+                  syncLockIconRect.y + 2,
+                  true);
 }
 
 void CommonTrackInfo::GetCloseBoxHorizontalBounds( const wxRect & rect, wxRect &dest )

@@ -8,6 +8,7 @@
 #include "../ProjectAudioManager.h"
 #include "ProjectHistory.h"
 #include "../ProjectWindows.h"
+#include "../AdornedRulerPanel.h"
 #include "../SelectUtilities.h"
 #include "../SoundActivatedRecord.h"
 #include "TrackFocus.h"
@@ -24,14 +25,23 @@
 #include "../toolbars/ToolManager.h"
 #include "AudacityMessageBox.h"
 #include "BasicUI.h"
+#include "Mix.h"
+#include "PlaybackSchedule.h"
 #include "ProgressDialog.h"
 
+#include <algorithm>
 #include <thread>
+#include <cmath>
 #include <float.h>
+#include <limits>
 #include <wx/app.h>
 
 // private helper classes and functions
 namespace {
+
+BoolSetting PlayOverAsDefault{
+   L"/GUI/PlayOverAsDefault", true
+};
 
 // TODO: Should all these functions which involve
 // the toolbar actually move into ControlToolBar?
@@ -137,6 +147,70 @@ bool IsLoopingEnabled(const AudacityProject& project)
     return playRegion.Active();
 }
 
+class PlayAroundSelectionPolicy final : public PlaybackPolicy
+{
+public:
+   PlayAroundSelectionPolicy(double selectionStart, double selectionEnd)
+      : mSelectionStart{ selectionStart }
+      , mSelectionEnd{ selectionEnd }
+   {
+   }
+
+   PlaybackSlice GetPlaybackSlice(
+      PlaybackSchedule &schedule, size_t available) override
+   {
+      auto cappedAvailable = available;
+      const auto producerTime = schedule.mTimeQueue.GetLastTime();
+      if (producerTime < mSelectionStart) {
+         const auto framesToSelection =
+            std::max<size_t>(
+               1, std::floor((mSelectionStart - producerTime) * mRate + 0.5));
+         cappedAvailable = std::min(cappedAvailable, framesToSelection);
+      }
+
+      return PlaybackPolicy::GetPlaybackSlice(schedule, cappedAvailable);
+   }
+
+   std::pair<double, double> AdvancedTrackTime(
+      PlaybackSchedule &schedule, double trackTime, size_t nSamples) override
+   {
+      const auto oldTime = trackTime;
+      auto realDuration = nSamples / mRate;
+      if (schedule.mEnvelope)
+         trackTime = schedule.SolveWarpedLength(trackTime, realDuration);
+      else
+         trackTime += realDuration;
+
+      if (oldTime < mSelectionStart && trackTime >= mSelectionStart) {
+         mDiscontinuity = true;
+         return { mSelectionStart, mSelectionEnd };
+      }
+
+      if (trackTime >= schedule.mT1)
+         return { schedule.mT1, std::numeric_limits<double>::infinity() };
+      return { trackTime, trackTime };
+   }
+
+   bool RepositionPlayback(
+      PlaybackSchedule &schedule, const Mixers &playbackMixers,
+      size_t, size_t) override
+   {
+      if (mDiscontinuity) {
+         mDiscontinuity = false;
+         schedule.mTimeQueue.SetLastTime(mSelectionEnd);
+         for (auto &mixer : playbackMixers)
+            mixer->Reposition(mSelectionEnd, true);
+      }
+
+      return false;
+   }
+
+private:
+   const double mSelectionStart;
+   const double mSelectionEnd;
+   bool mDiscontinuity{ false };
+};
+
 }
 
 // Strings for menu items and also for dialog titles
@@ -149,13 +223,32 @@ static const auto SetLoopOutTitle = XXO("Set Loop &Out");
 
 namespace {
 
+void DoPlayDefaultOrStop(const CommandContext &context);
+void DoPlayAroundSelection(const CommandContext &context);
+
+void OnPlayOverAsDefault(const CommandContext&)
+{
+   PlayOverAsDefault.Toggle();
+}
+
 // This plays (once, with fixed bounds) OR Stops audio.  It's a toggle.
-// The default binding for Shift+SPACE.
 void OnPlayOnceOrStop(const CommandContext &context)
 {
    if (TransportUtilities::DoStopPlaying(context.project))
       return;
    TransportUtilities::DoStartPlaying(context.project);
+}
+
+void OnSetSentinelToCursor(const CommandContext &context)
+{
+   auto &project = context.project;
+   const auto cursorTime = ViewInfo::Get(project).selectedRegion.t0();
+
+   // Ctrl+Shift+Space gives the explicit play-over anchor the same position as
+   // the regular edit cursor, without changing the selection or starting audio.
+   ProjectAudioManager::Get(project).SetSentinelPlaybackPosition(cursorTime);
+   TrackPanel::Get(project).Refresh(false);
+   AdornedRulerPanel::Get(project).Refresh(false);
 }
 
 void OnPlayStopSelect(const CommandContext &context)
@@ -164,8 +257,7 @@ void OnPlayStopSelect(const CommandContext &context)
 }
 
 // This plays (looping, maybe adjusting the loop) OR Stops audio.  It's a toggle.
-// The default binding for SPACE
-void OnPlayDefaultOrStop(const CommandContext &context)
+void DoPlayDefaultOrStop(const CommandContext &context)
 {
    auto &project = context.project;
    if (TransportUtilities::DoStopPlaying(project))
@@ -177,6 +269,77 @@ void OnPlayDefaultOrStop(const CommandContext &context)
    // Now play in a loop
    // Will automatically set mLastPlayMode
    TransportUtilities::PlayCurrentRegionAndWait(context, true);
+}
+
+void DoPlayAroundSelection(const CommandContext &context)
+{
+   auto &project = context.project;
+   if (TransportUtilities::DoStopPlaying(project))
+      return;
+
+   auto &viewInfo = ViewInfo::Get(project);
+   const auto &selectedRegion = viewInfo.selectedRegion;
+
+   if (!MakeReadyToPlay(project))
+      return;
+
+   auto &tracks = TrackList::Get(project);
+   const auto projectStart = tracks.GetStartTime();
+   const auto projectEnd = tracks.GetEndTime();
+   if (projectEnd <= projectStart)
+      return;
+
+   auto &projectAudioManager = ProjectAudioManager::Get(project);
+   // A user-placed sentinel is the explicit Play Around Selection anchor.
+   // Fall back to the same visible start point used by regular playback,
+   // not the hidden last-known playback position.
+   auto sentinelStart = projectAudioManager.GetSentinelPlaybackPosition();
+   auto start = sentinelStart
+      ? *sentinelStart
+      : viewInfo.playRegion.GetStart();
+   start = std::clamp(start, projectStart, projectEnd);
+
+   const auto selectionStart =
+      std::clamp(selectedRegion.t0(), projectStart, projectEnd);
+   const auto selectionEnd =
+      std::clamp(selectedRegion.t1(), projectStart, projectEnd);
+   const auto hasSelection =
+      !selectedRegion.isPoint() && selectionStart < selectionEnd;
+   if (hasSelection && start >= selectionStart && start < selectionEnd)
+      start = selectionEnd;
+   if (start >= projectEnd)
+      return;
+
+   auto options = ProjectAudioIO::GetDefaultOptions(project);
+   options.pStartTime.emplace(start);
+   if (hasSelection) {
+      options.policyFactory =
+         [selectionStart, selectionEnd](const AudioIOStartStreamOptions&)
+            -> std::unique_ptr<PlaybackPolicy>
+         {
+            return std::make_unique<PlayAroundSelectionPolicy>(
+               selectionStart, selectionEnd);
+         };
+   }
+
+   projectAudioManager.PlayPlayRegion(
+      SelectedRegion(projectStart, projectEnd), options, PlayMode::normalPlay);
+}
+
+void OnPlayDefaultOrStop(const CommandContext &context)
+{
+   if (PlayOverAsDefault.Read())
+      DoPlayAroundSelection(context);
+   else
+      DoPlayDefaultOrStop(context);
+}
+
+void OnPlayAroundSelection(const CommandContext &context)
+{
+   if (PlayOverAsDefault.Read())
+      DoPlayDefaultOrStop(context);
+   else
+      DoPlayAroundSelection(context);
 }
 
 void OnPause(const CommandContext &context)
@@ -733,13 +896,20 @@ auto TransportMenu()
    Menu( wxT("Transport"), XXO("Tra&nsport"),
       Section( "Basic",
          Menu( wxT("Play"), XXO("Pl&aying"),
+            Command( wxT("PlayOverAsDefault"), XXO("Play-over as default"),
+               OnPlayOverAsDefault, AlwaysEnabledFlag,
+               Options{}.CheckTest(PlayOverAsDefault) ),
             /* i18n-hint: (verb) Start or Stop audio playback*/
             Command( wxT("DefaultPlayStop"), XXO("Pl&ay/Stop"), OnPlayDefaultOrStop,
                CanStopAudioStreamFlag(), wxT("Space") ),
             Command( wxT("PlayStopSelect"), XXO("Play/Stop and &Set Cursor"),
                OnPlayStopSelect, CanStopAudioStreamFlag(), wxT("X") ),
+            Command( wxT("PlayAroundSelection"), XXO("Play around selection"),
+               OnPlayAroundSelection, CanStopAudioStreamFlag(), wxT("Shift+Space") ),
+            Command( wxT("SetSentinelToCursor"), XXO("Set sentinel cursor to regular cursor"),
+               OnSetSentinelToCursor, AlwaysEnabledFlag, wxT("Ctrl+Shift+Space") ),
             Command( wxT("OncePlayStop"), XXO("Play &Once/Stop"), OnPlayOnceOrStop,
-               CanStopAudioStreamFlag(), wxT("Shift+Space") ),
+               CanStopAudioStreamFlag() ),
             Command( wxT("Pause"), XXO("&Pause"), OnPause,
                CanStopAudioStreamFlag(), wxT("P") )
          ),

@@ -1,6 +1,8 @@
 
 #include <wx/app.h>
 #include <wx/bmpbuttn.h>
+#include <wx/button.h>
+#include <wx/sizer.h>
 #include <wx/textctrl.h>
 #include <wx/frame.h>
 
@@ -69,6 +71,58 @@ public:
    bool mbSoundActivated;
    DECLARE_EVENT_TABLE()
 };
+
+class PodcastHacksDialog final : public wxDialogWrapper
+{
+public:
+   explicit PodcastHacksDialog(wxWindow *parent)
+      : wxDialogWrapper(parent, wxID_ANY, XO("DusteDs podcast hacks"),
+         wxDefaultPosition, wxSize(560, 360),
+         wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+   {
+      auto sizer = safenew wxBoxSizer(wxVERTICAL);
+      auto text = safenew wxTextCtrl(this, wxID_ANY,
+         wxString{}
+            << "Ctrl + Click - Set sentinel cursor.\n"
+            << "Ctrl + Shift + Space - Set sentinel cursor to regular cursor position.\n"
+            << "Select menu contains Adjust to Zero Cross on select - no need to press Z key after each selection.\n"
+            << "Transport > Playing contains Play-over as default - when enabled, Space plays from sentinel cursor and skips over any selection; Shift + Space does regular playback.\n"
+            << "Tracks can be excluded from Sync-Lock by clicking their icon (green = included, red = ignored).\n"
+            << "View menu contains Show content track - draws a movable, resizable non-audio helper track. The top half shows Off below -99 dB, Silence below -40 dB, and On at -40 dB or louder; the bottom half shows overlay risk as green, yellow, or red, using 100-sample confirmation windows. The track can be disabled from its label area to freeze updates.",
+         wxDefaultPosition, wxDefaultSize,
+         wxTE_MULTILINE | wxTE_READONLY | wxTE_WORDWRAP | wxBORDER_NONE);
+      sizer->Add(text, 1, wxEXPAND | wxALL, 12);
+
+      auto close = safenew wxButton(this, wxID_CLOSE, _("Close"));
+      close->Bind(wxEVT_BUTTON, [this](wxCommandEvent&){ Destroy(); });
+      sizer->Add(close, 0, wxALIGN_RIGHT | wxLEFT | wxRIGHT | wxBOTTOM, 12);
+
+      SetSizerAndFit(sizer);
+      SetMinSize(wxSize(520, 300));
+      CenterOnParent();
+      Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent&){ Destroy(); });
+   }
+
+   ~PodcastHacksDialog() override
+   {
+      if (sActiveDialog == this)
+         sActiveDialog = nullptr;
+   }
+
+   static void Show(wxWindow *parent)
+   {
+      if (!sActiveDialog)
+         sActiveDialog = safenew PodcastHacksDialog(parent);
+
+      sActiveDialog->wxDialogWrapper::Show();
+      sActiveDialog->Raise();
+   }
+
+private:
+   static PodcastHacksDialog *sActiveDialog;
+};
+
+PodcastHacksDialog *PodcastHacksDialog::sActiveDialog{};
 
 
 #define FixButtonID           7001
@@ -256,6 +310,11 @@ void OnQuickHelp(const CommandContext &context)
    HelpSystem::ShowHelp(
       &GetProjectFrame( project ),
       L"Quick_Help");
+}
+
+void OnPodcastHacks(const CommandContext &context)
+{
+   PodcastHacksDialog::Show(&GetProjectFrame(context.project));
 }
 
 void OnManual(const CommandContext &context)
@@ -480,6 +539,9 @@ auto HelpMenu()
             OnCheckForUpdates,
             AlwaysEnabledFlag ),
    #endif
+         Command( wxT("PodcastHacks"), XXO("DusteDs podcast hacks"),
+            OnPodcastHacks,
+            AlwaysEnabledFlag ),
          Command( wxT("About"), XXO("&About Audacity"), OnAbout,
             AlwaysEnabledFlag )
       )

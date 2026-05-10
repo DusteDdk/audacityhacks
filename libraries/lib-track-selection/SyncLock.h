@@ -61,6 +61,15 @@ public:
    static bool IsSelectedOrSyncLockSelectedP(const Track *pTrack)
    { return pTrack && IsSelectedOrSyncLockSelected(*pTrack); }
 
+   //! @return whether this track type can participate in sync-lock groups.
+   static bool IsSyncLockable(const Track &track);
+
+   //! @return whether the user has opted this track out of sync-lock groups.
+   static bool IsExcluded(const Track &track);
+
+   //! Opt this track out of, or back into, sync-lock groups.
+   static void SetExcluded(Track &track, bool excluded);
+
    /*! @pre `track.GetOwner() != nullptr` */
    static TrackIterRange<Track> Group(Track &track);
 

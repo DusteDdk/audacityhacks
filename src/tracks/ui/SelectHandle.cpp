@@ -20,8 +20,10 @@ Paul Licameli split from TrackPanel.cpp
 #include "LabelTrack.h"
 #include "../playabletrack/wavetrack/ui/PitchAndSpeedDialog.h"
 #include "NumberScale.h"
+#include "../../AdornedRulerPanel.h"
 #include "Project.h"
 #include "ProjectAudioIO.h"
+#include "../../ProjectAudioManager.h"
 #include "ProjectHistory.h"
 #include "../../ProjectSettings.h"
 #include "../../ProjectWindow.h"
@@ -65,6 +67,22 @@ bool SelectHandle::IsDragging() const
 
 namespace
 {
+   SnapPointArray FindSelectionSnapPoints(
+      const AudacityProject &project, const ViewInfo &viewInfo)
+   {
+      SnapPointArray candidates{
+         SnapPoint{ viewInfo.playRegion.GetLastActiveStart() },
+         SnapPoint{ viewInfo.playRegion.GetLastActiveEnd() },
+      };
+
+      // The sentinel is a project-wide anchor, so it has no owning track.
+      if (const auto sentinel =
+         ProjectAudioManager::Get(project).GetSentinelPlaybackPosition())
+         candidates.emplace_back(*sentinel);
+
+      return candidates;
+   }
+
    /// Converts a frequency to screen y position.
    wxInt64 FrequencyToPosition(const WaveChannel &wc,
       double frequency,
@@ -427,10 +445,8 @@ SelectHandle::SelectHandle(
 )  : mpView{ pChannelView }
    // Selection dragging can snap to play region boundaries
    , mSnapManager{ std::make_shared<SnapManager>(
-      *trackList.GetOwner(), trackList, viewInfo, SnapPointArray{
-         SnapPoint{ viewInfo.playRegion.GetLastActiveStart() },
-         SnapPoint{ viewInfo.playRegion.GetLastActiveEnd() },
-   } ) }
+      *trackList.GetOwner(), trackList, viewInfo,
+      FindSelectionSnapPoints(*trackList.GetOwner(), viewInfo) ) }
 {
    const wxMouseState &state = st.state;
    mRect = st.rect;
@@ -561,6 +577,16 @@ UIHandle::Result SelectHandle::Click(
    mMostRecentX = event.m_x;
    mMostRecentY = event.m_y;
 
+   if (event.LeftDown() && event.ControlDown()) {
+      const auto sentinelTime = viewInfo.PositionToTime(event.m_x, mRect.x);
+      // Ctrl-click is reserved for an explicit Play Around Selection anchor,
+      // so do not also run the legacy selection-extension branch below.
+      ProjectAudioManager::Get(*pProject).SetSentinelPlaybackPosition(sentinelTime);
+      trackPanel.Refresh(false);
+      AdornedRulerPanel::Get(*pProject).Refresh(false);
+      return RefreshAll | Cancelled;
+   }
+
    bool selectChange = (
       event.LeftDown() &&
       event.ControlDown() &&
@@ -603,6 +629,7 @@ UIHandle::Result SelectHandle::Click(
          }
       }
 
+      SelectUtilities::MaybeAdjustSelectionToZeroCrossing(*pProject, true);
       ProjectHistory::Get( *pProject ).ModifyState(false);
 
       // Do not start a drag
@@ -1015,7 +1042,9 @@ UIHandle::Result SelectHandle::Release(
 {
    PitchAndSpeedDialog::Get(*pProject).TryRetarget(event);
    using namespace RefreshCode;
-   ProjectHistory::Get( *pProject ).ModifyState(false);
+   // Only time-selection drags should auto-adjust to zero crossings.  Frequency
+   // selection edits share this handle but must keep their time bounds intact.
+   const bool adjustTimeSelection = mSelStartValid;
    mFrequencySnapper.reset();
    mSnapManager.reset();
    if (mSelectionStateChanger) {
@@ -1023,7 +1052,12 @@ UIHandle::Result SelectHandle::Release(
       mSelectionStateChanger.reset();
    }
 
-   if (mUseSnap && (mSnapStart.outCoord != -1 || mSnapEnd.outCoord != -1))
+   const bool adjusted =
+      adjustTimeSelection &&
+      SelectUtilities::MaybeAdjustSelectionToZeroCrossing(*pProject, true);
+   ProjectHistory::Get( *pProject ).ModifyState(false);
+
+   if (adjusted || (mUseSnap && (mSnapStart.outCoord != -1 || mSnapEnd.outCoord != -1)))
       return RefreshAll;
    else
       return RefreshNone;
